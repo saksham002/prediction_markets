@@ -24,7 +24,7 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 # Market identifier - using slug is the most reliable method
 MARKET_SLUG = "russia-x-ukraine-ceasefire-by-january-31-2026"
 MARKET_TITLE = "Russia x Ukraine ceasefire by January 31, 2026?"
-ODDS_THRESHOLD = 0.01  # 20%
+ODDS_THRESHOLD = 0.20  # 20%
 
 # Twilio credentials (set via environment variables for security)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
@@ -251,7 +251,7 @@ def check_and_notify() -> dict:
             f"Market: {market_question}\n\n"
             f"'Yes' odds are now at {yes_percentage:.2f}%\n"
             f"(Threshold: {threshold_percentage:.2f}%)\n\n"
-            f"Check it out: https://polymarket.com"
+            f"Check it out: https://polymarket.com/event/russia-x-ukraine-ceasefire-by-january-31-2026"
         )
         
         result["notification_sent"] = send_whatsapp_notification(message)
