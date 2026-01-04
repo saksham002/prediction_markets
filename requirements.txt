@@ -1,0 +1,4 @@
+# Minimal dependencies for russia_ukraine_ceasefire.py
+requests>=2.28.0
+twilio>=8.0.0
+
