@@ -7,18 +7,11 @@ and sends a WhatsApp notification via Twilio if "Yes" odds exceed 20%.
 
 Uses the Gamma API (https://gamma-api.polymarket.com) which is the fastest option
 for fetching market data - it's a lightweight REST API optimized for market info.
-
-POLLING STRATEGY:
-- GitHub Actions cron runs every 5 minutes (minimum allowed)
-- This script loops every 10 seconds for ~290 seconds (~4:50)
-- This achieves effective 10-second polling without hitting cron limits
 """
 
 import os
 import sys
-import time
 import requests
-from datetime import datetime
 from twilio.rest import Client
 
 # =============================================================================
@@ -31,11 +24,6 @@ GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 # Market search parameters
 MARKET_TITLE = "Russia x Ukraine ceasefire by January 31, 2026?"
 ODDS_THRESHOLD = 0.20  # 20%
-
-# Polling configuration
-# GitHub Actions cron minimum is 5 minutes, so we loop internally
-POLL_INTERVAL_SECONDS = 10      # Check every 10 seconds
-POLL_DURATION_SECONDS = 290     # Run for ~4:50 (just under 5 min to avoid overlap)
 
 # Twilio credentials (set via environment variables for security)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
@@ -225,10 +213,6 @@ def check_and_notify() -> dict:
     # Search for the market
     market = search_market_by_title(MARKET_TITLE)
     
-    if not market:
-        # Try alternate search terms
-        print("Trying alternate search...")
-        market = search_market_by_title("Russia Ukraine ceasefire January 2026")
     
     if not market:
         result["error"] = "Market not found"
@@ -276,84 +260,31 @@ def check_and_notify() -> dict:
     return result
 
 
-def run_single_check() -> dict:
-    """Run a single check and return results (without printing banner)."""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\n[{timestamp}] Checking market odds...")
-    
-    result = check_and_notify()
-    
-    if result['yes_odds'] is not None:
-        print(f"[{timestamp}] Yes odds: {result['yes_odds'] * 100:.2f}%")
-    if result['error']:
-        print(f"[{timestamp}] Error: {result['error']}")
-    
-    return result
-
-
 def main():
-    """
-    Entry point for the script.
-    
-    Runs in a loop, checking every POLL_INTERVAL_SECONDS for POLL_DURATION_SECONDS.
-    This allows effective 10-second polling while using 5-minute GitHub Actions cron.
-    """
+    """Entry point for the script."""
     print("=" * 60)
     print("Polymarket Russia-Ukraine Ceasefire Monitor")
     print("=" * 60)
-    print(f"Polling every {POLL_INTERVAL_SECONDS} seconds for {POLL_DURATION_SECONDS} seconds")
-    print(f"Threshold: {ODDS_THRESHOLD * 100:.0f}%")
-    print("=" * 60)
+    print()
     
-    start_time = time.time()
-    check_count = 0
-    notification_sent = False
-    last_result = None
+    result = check_and_notify()
     
-    while True:
-        elapsed = time.time() - start_time
-        
-        # Exit if we've exceeded the poll duration
-        if elapsed >= POLL_DURATION_SECONDS:
-            print(f"\n[DONE] Polling duration ({POLL_DURATION_SECONDS}s) reached. Exiting.")
-            break
-        
-        check_count += 1
-        result = run_single_check()
-        last_result = result
-        
-        # If notification was sent this cycle, we can stop checking
-        # (to avoid spamming with notifications every 10 seconds)
-        if result.get("notification_sent"):
-            notification_sent = True
-            print("\n[ALERT SENT] Notification delivered. Stopping further checks this cycle.")
-            break
-        
-        # Calculate remaining time
-        remaining = POLL_DURATION_SECONDS - elapsed
-        sleep_time = min(POLL_INTERVAL_SECONDS, remaining)
-        
-        if sleep_time > 0 and remaining > POLL_INTERVAL_SECONDS:
-            print(f"[WAIT] Sleeping {POLL_INTERVAL_SECONDS}s... ({remaining:.0f}s remaining in cycle)")
-            time.sleep(sleep_time)
-    
-    # Final summary
     print()
     print("-" * 60)
-    print("Session Summary:")
-    print(f"  Total checks: {check_count}")
-    print(f"  Duration: {time.time() - start_time:.1f}s")
-    if last_result:
-        print(f"  Last Yes odds: {last_result['yes_odds'] * 100:.2f}%" if last_result.get('yes_odds') else "  Last Yes odds: N/A")
-        print(f"  Threshold exceeded: {last_result.get('threshold_exceeded', False)}")
-    print(f"  Notification sent: {notification_sent}")
+    print("Summary:")
+    print(f"  Market found: {result['market_found']}")
+    print(f"  Yes odds: {result['yes_odds'] * 100:.2f}%" if result['yes_odds'] else "  Yes odds: N/A")
+    print(f"  Threshold exceeded: {result['threshold_exceeded']}")
+    print(f"  Notification sent: {result['notification_sent']}")
+    if result['error']:
+        print(f"  Error: {result['error']}")
     print("-" * 60)
     
-    # Exit with error if last check had an error
-    if last_result and last_result.get('error'):
+    # Exit with error code if there was an issue
+    if result['error']:
         sys.exit(1)
     
-    return last_result
+    return result
 
 
 if __name__ == "__main__":
