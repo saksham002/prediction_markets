@@ -21,9 +21,10 @@ from twilio.rest import Client
 # Polymarket Gamma API - fastest option for market data (simple REST, no auth needed)
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 
-# Market search parameters
+# Market identifier - using slug is the most reliable method
+MARKET_SLUG = "russia-x-ukraine-ceasefire-by-january-31-2026"
 MARKET_TITLE = "Russia x Ukraine ceasefire by January 31, 2026?"
-ODDS_THRESHOLD = 0.20  # 20%
+ODDS_THRESHOLD = 0.01  # 20%
 
 # Twilio credentials (set via environment variables for security)
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
@@ -87,15 +88,16 @@ def get_market_by_slug(slug: str) -> dict | None:
     """
     Get a specific market by its slug (URL identifier).
     
-    This is the fastest method if you know the market's slug.
+    This is the fastest and most reliable method.
+    Endpoint: GET /markets/slug/{slug}
     
     Args:
-        slug: The market's URL slug
+        slug: The market's URL slug (e.g., "russia-x-ukraine-ceasefire-by-january-31-2026")
         
     Returns:
         Market data dict if found, None otherwise
     """
-    url = f"{GAMMA_API_BASE}/markets/{slug}"
+    url = f"{GAMMA_API_BASE}/markets/slug/{slug}"
     
     try:
         response = requests.get(url, timeout=30)
@@ -208,11 +210,10 @@ def check_and_notify() -> dict:
         "error": None
     }
     
-    print(f"Searching for market: {MARKET_TITLE}")
+    print(f"Fetching market by slug: {MARKET_SLUG}")
     
-    # Search for the market
-    market = search_market_by_title(MARKET_TITLE)
-    
+    # Fetch market directly by slug (most reliable method)
+    market = get_market_by_slug(MARKET_SLUG)
     
     if not market:
         result["error"] = "Market not found"
