@@ -1,22 +1,15 @@
 """
 TradeFillMA: Exponential moving average of signed aggressor fill quantities.
 
-Signal = EMA(yes_aggressor_qty) - EMA(no_aggressor_qty)
+Single-market mode:
+  Signal = EMA(yes_aggressor_qty) - EMA(no_aggressor_qty)
 
-Positive → recent buying pressure on yes side (bullish).
-Negative → recent buying pressure on no side (bearish / yes-side selling).
+Pair mode for "A vs B" winner markets:
+  Positive → recent aggressive flow favoring the first-listed team A
+  Negative → recent aggressive flow favoring the second team B
 
-Supports two decay modes:
-  - Count-based: decay per fill with `half_life_fills` (e.g. half_life_fills=50
-    means each new fill decays prior fills by factor 2^(-1/50)).
-  - Time-based: decay per second with `half_life_s` seconds.
-    Time source can be "exchange" (trade msg ts, unix epoch) or "local" (monotonic clock).
-
-A single instance tracks all configured half-lives simultaneously and returns
-a dict of signal values keyed by label.
-
-Aggressor direction is inferred from the trade's `taker_side` field
-in the Kalshi `trade` WebSocket channel. Trade ts is unix epoch (int seconds).
+In pair mode, A YES and B NO are treated as the same directional flow, while
+A NO and B YES are treated as the mirrored opposite.
 """
 
 import math
@@ -42,27 +35,29 @@ class TradeFillMA(Alpha):
     Directional signal from exponentially smoothed aggressor fill quantities.
 
     Tracks multiple half-lives in a single instance. Each half-life maintains
-    its own yes/no EMA pair. Signal per half-life = ema_yes - ema_no.
+    one signed EMA. Pair mode uses the first ticker as the positive direction.
     """
 
     def __init__(
         self,
-        ticker: str,
+        ticker: str | None = None,
         *,
+        pair_tickers: tuple[str, str] | None = None,
         half_life_fills: dict[str, int] | None = None,
         half_life_seconds: dict[str, float] | None = None,
         time_source: str = "exchange",
     ):
         """
-        Provide one or both of half_life_fills and half_life_seconds.
-
-        half_life_fills: {"w50": 50, "w100": 100} — count-based EMA, decay per fill.
-        half_life_seconds: {"1s": 1, "1m": 60, ...} — time-based EMA, decay per second.
-        time_source: "exchange" uses trade msg unix epoch, "local" uses monotonic clock.
-                     Only relevant for time-based half-lives.
+        Provide exactly one of ticker or pair_tickers, plus one or both half-life configs.
         """
-        super().__init__(ticker)
+        if (ticker is None) == (pair_tickers is None):
+            raise ValueError("Provide exactly one of ticker or pair_tickers")
+
+        alpha_id = ticker if ticker is not None else f"{pair_tickers[0]}__{pair_tickers[1]}"
+        super().__init__(alpha_id)
         self.time_source = time_source
+        self.single_ticker = ticker
+        self.pair_tickers = pair_tickers
 
         self._count_hls: dict[str, float] = {}
         self._time_hls: dict[str, float] = {}
@@ -80,20 +75,21 @@ class TradeFillMA(Alpha):
         if not self._count_hls and not self._time_hls:
             raise ValueError("Provide at least one of half_life_fills or half_life_seconds")
 
-        # EMA state per label
-        self._yes_ema: dict[str, float] = {}
-        self._no_ema: dict[str, float] = {}
+        # EMA state per label (raw signed qty + price-weighted signed qty)
+        self._ema: dict[str, float] = {}
+        self._ema_pw: dict[str, float] = {}
         all_labels = list(self._count_hls.keys()) + list(self._time_hls.keys())
         for label in all_labels:
-            self._yes_ema[label] = 0.0
-            self._no_ema[label] = 0.0
+            self._ema[label] = 0.0
+            self._ema_pw[label] = 0.0
 
         self._last_time: float | None = None
+        self._last_trade_wall_time: float | None = None
         self._n_fills = 0
 
     @property
     def labels(self) -> list[str]:
-        return list(self._yes_ema.keys())
+        return list(self._ema.keys())
 
     @property
     def name(self) -> str:
@@ -105,21 +101,53 @@ class TradeFillMA(Alpha):
 
     def _get_time(self, msg: dict | None = None) -> float:
         """Get current time from the configured source."""
-        if self.time_source == "exchange" and msg is not None:
-            ts = msg.get("ts")
-            if ts is not None:
-                return float(ts)
+        if self.time_source == "exchange":
+            if msg is not None:
+                ts = msg.get("ts")
+                if ts is not None:
+                    return float(ts)
+            # No msg available — use wall clock (same domain as unix epoch)
+            return time.time()
         return time.monotonic()
+
+    def _signed_qty(self, msg: dict) -> float | None:
+        ticker = msg["market_ticker"]
+        side = msg["taker_side"]
+        qty = float(msg["count_fp"])
+
+        if self.single_ticker is not None:
+            if ticker != self.single_ticker:
+                return None
+            return qty if side == "yes" else -qty
+
+        first_ticker, second_ticker = self.pair_tickers
+        if ticker == first_ticker:
+            return qty if side == "yes" else -qty
+        if ticker == second_ticker:
+            return qty if side == "no" else -qty
+        return None
+
+    def _trade_price(self, msg: dict) -> float:
+        """Aggressor-side fill price in dollars. Derives from the complement if one side's key is absent."""
+        side = msg["taker_side"]
+        if side == "yes":
+            if "yes_price_dollars" in msg:
+                return float(msg["yes_price_dollars"])
+            return 1.0 - float(msg["no_price_dollars"])
+        if "no_price_dollars" in msg:
+            return float(msg["no_price_dollars"])
+        return 1.0 - float(msg["yes_price_dollars"])
 
     def on_message(self, channel: str, msg: dict):
         if channel != "trade":
             return
-        if msg["market_ticker"] != self.ticker:
+
+        signed_qty = self._signed_qty(msg)
+        if signed_qty is None:
             return
 
-        side = msg["taker_side"]
-        qty = float(msg["count_fp"])
         self._n_fills += 1
+        weighted_qty = signed_qty * self._trade_price(msg)
 
         # Time-based decay
         now = self._get_time(msg)
@@ -127,42 +155,69 @@ class TradeFillMA(Alpha):
             dt = max(now - self._last_time, 0.0)
             for label, decay in self._time_hls.items():
                 factor = math.exp(-decay * dt)
-                self._yes_ema[label] *= factor
-                self._no_ema[label] *= factor
+                self._ema[label] *= factor
+                self._ema_pw[label] *= factor
         self._last_time = now
 
         # Count-based decay (once per fill)
         for label, decay in self._count_hls.items():
             factor = math.exp(-decay)
-            self._yes_ema[label] *= factor
-            self._no_ema[label] *= factor
+            self._ema[label] *= factor
+            self._ema_pw[label] *= factor
 
-        # Add new fill
-        if side == "yes":
-            for label in self._yes_ema:
-                self._yes_ema[label] += qty
-        else:
-            for label in self._no_ema:
-                self._no_ema[label] += qty
+        self._last_trade_wall_time = time.time()
 
-    def values(self) -> dict[str, float | None]:
-        """Current signal value per half-life label. None if no fills yet."""
+        for label in self._ema:
+            self._ema[label] += signed_qty
+            self._ema_pw[label] += weighted_qty
+
+    def values(self, now: float | None = None) -> dict[str, float | None]:
+        """Current signal value per half-life label. None if no fills yet. Read-only.
+
+        now: optional timestamp in the same domain as the message times
+        (exchange epoch when time_source == "exchange"). Used for replay,
+        where wall-clock staleness would be wrong.
+        """
         if self._n_fills == 0:
-            return {label: None for label in self._yes_ema}
+            return {label: None for label in self._ema}
 
-        # Decay time-based EMAs to current time before reading
-        now = self._get_time()
-        if self._last_time is not None:
+        # Compute time-decay factor without mutating state
+        # Always use wall-clock time for staleness decay (avoids domain mismatch)
+        if now is not None and self._last_time is not None:
             dt = max(now - self._last_time, 0.0)
-            for label, decay in self._time_hls.items():
-                factor = math.exp(-decay * dt)
-                self._yes_ema[label] *= factor
-                self._no_ema[label] *= factor
-        self._last_time = now
+        elif self._time_hls and self._last_trade_wall_time is not None:
+            dt = max(time.time() - self._last_trade_wall_time, 0.0)
+        else:
+            dt = 0.0
 
         result = {}
-        for label in self._yes_ema:
-            result[label] = self._yes_ema[label] - self._no_ema[label]
+        for label in self._ema:
+            value = self._ema[label]
+            if label in self._time_hls and dt > 0:
+                factor = math.exp(-self._time_hls[label] * dt)
+                value *= factor
+            result[label] = value
+        return result
+
+    def values_pw(self, now: float | None = None) -> dict[str, float | None]:
+        """Price-weighted signed-qty EMA per half-life label. None if no fills yet."""
+        if self._n_fills == 0:
+            return {label: None for label in self._ema_pw}
+
+        if now is not None and self._last_time is not None:
+            dt = max(now - self._last_time, 0.0)
+        elif self._time_hls and self._last_trade_wall_time is not None:
+            dt = max(time.time() - self._last_trade_wall_time, 0.0)
+        else:
+            dt = 0.0
+
+        result = {}
+        for label in self._ema_pw:
+            value = self._ema_pw[label]
+            if label in self._time_hls and dt > 0:
+                factor = math.exp(-self._time_hls[label] * dt)
+                value *= factor
+            result[label] = value
         return result
 
     @property

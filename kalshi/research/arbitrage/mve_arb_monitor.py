@@ -9,168 +9,23 @@ Since yes_ask = 1 - no_bid, long arb ↔ sum(no_bid_i) > N - 1.
 
 import argparse
 import asyncio
-import base64
 import csv
 import json
 import os
+import signal
 import sys
-import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-import requests
 import websockets
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from dotenv import load_dotenv
-
-load_dotenv(dotenv_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.utils.timestamp import Timestamp
+from src.utils.api import ws_auth_headers, paginate, discover_top_events, WS_URL
+from src.utils.orderbook import BookSide, MarketBook
 
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 OUTPUT_DIR = Path("/data/user_data/saksham3/kalshi/arb_logs")
-
-
-# --- Auth ---
-
-def _load_private_key():
-    pk_path = os.environ["KALSHI_PRIVATE_KEY_PATH"]
-    with open(pk_path, "rb") as f:
-        return serialization.load_pem_private_key(f.read(), password = None)
-
-
-def _sign(private_key, text: str) -> str:
-    signature = private_key.sign(
-        text.encode("utf-8"),
-        padding.PSS(
-            mgf = padding.MGF1(hashes.SHA256()),
-            salt_length = padding.PSS.DIGEST_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(signature).decode("utf-8")
-
-
-def _ws_auth_headers():
-    key_id = os.environ["KALSHI_KEY_ID"]
-    private_key = _load_private_key()
-    timestamp_ms = str(int(time.time() * 1000))
-    message = timestamp_ms + "GET" + "/trade-api/ws/v2"
-    signature = _sign(private_key, message)
-    return {
-        "KALSHI-ACCESS-KEY": key_id,
-        "KALSHI-ACCESS-SIGNATURE": signature,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-    }
-
-
-# --- REST: discover top multivariate events ---
-
-def api_get(url, params = None):
-    for attempt in range(5):
-        resp = requests.get(url, params = params, timeout = 30)
-        if resp.status_code == 429:
-            time.sleep(2 ** attempt)
-            continue
-        resp.raise_for_status()
-        return resp
-    resp.raise_for_status()
-
-
-def paginate(endpoint, params = None, key = None, max_per_page = 1000):
-    if key is None:
-        key = endpoint.strip("/").split("/")[-1]
-    params = dict(params or {})
-    params["limit"] = max_per_page
-    all_items = []
-    cursor = None
-    while True:
-        if cursor:
-            params["cursor"] = cursor
-        data = api_get(f"{BASE_URL}/{endpoint}", params = params).json()
-        items = data.get(key, [])
-        all_items.extend(items)
-        cursor = data.get("cursor", "")
-        if not cursor or not items:
-            break
-        time.sleep(0.15)
-    return all_items
-
-
-
-def discover_top_events(n: int):
-    """Find top N active events (with 2+ markets) by total volume."""
-    print("Fetching active events with nested markets...")
-    events = paginate(
-        "events",
-        params = {"status": "open", "with_nested_markets": True},
-        key = "events",
-        max_per_page = 200,
-    )
-    print(f"  {len(events)} active events found")
-
-    scored = []
-    for ev in events:
-        mkts = ev.get("markets", [])
-        if len(mkts) < 2:
-            continue
-        total_vol = sum(float(m["volume_fp"]) for m in mkts)
-        scored.append((ev, mkts, total_vol))
-
-    scored.sort(key = lambda x: x[2], reverse = True)
-    top = scored[:n]
-
-    result = []
-    for ev, mkts, total_vol in top:
-        et = ev["event_ticker"]
-        result.append({
-            "event_ticker": et,
-            "title": ev.get("title", et),
-            "volume": total_vol,
-            "markets": mkts,
-            "tickers": [m["ticker"] for m in mkts],
-        })
-        print(f"  [{et}] volume={total_vol:.0f} markets={len(mkts)} title={ev.get('title', '')[:60]}")
-
-    return result
-
-
-# --- Orderbook state ---
-
-@dataclass
-class BookSide:
-    levels: dict[str, float] = field(default_factory = dict)
-
-    def apply_delta(self, price: str, delta: float):
-        current = self.levels.get(price, 0.0)
-        new_qty = current + delta
-        if new_qty <= 0:
-            self.levels.pop(price, None)
-        else:
-            self.levels[price] = new_qty
-
-    def best_bid(self) -> tuple[float | None, float | None]:
-        if not self.levels:
-            return None, None
-        best_price = max(self.levels.keys(), key = lambda p: float(p))
-        return float(best_price), self.levels[best_price]
-
-    def load_snapshot(self, levels: list[list[str]]):
-        self.levels.clear()
-        for price, qty in levels:
-            q = float(qty)
-            if q > 0:
-                self.levels[price] = q
-
-
-@dataclass
-class MarketBook:
-    yes: BookSide = field(default_factory = BookSide)
-    no: BookSide = field(default_factory = BookSide)
 
 
 # --- Active arb tracking ---
@@ -188,7 +43,7 @@ class ActiveArb:
 # --- Monitor ---
 
 class ArbMonitor:
-    def __init__(self, events: list[dict]):
+    def __init__(self, events: list[dict], writer: csv.writer, log_file):
         self.events = events
         self.ticker_to_event = {}
         for ev in events:
@@ -202,19 +57,8 @@ class ArbMonitor:
 
         self.event_info = {ev["event_ticker"]: ev for ev in events}
 
-
-        OUTPUT_DIR.mkdir(parents = True, exist_ok = True)
-        log_path = OUTPUT_DIR / "arb_log.csv"
-        self._log_file = open(log_path, "a", newline = "")
-        self._writer = csv.writer(self._log_file)
-        if log_path.stat().st_size == 0:
-            self._writer.writerow([
-                "event_ticker", "title", "side",
-                "profit_per_contract", "max_profit_per_contract", "min_qty",
-                "open_local_ts", "open_exchange_ts",
-                "close_local_ts", "close_exchange_ts",
-                "duration_local_s", "duration_exchange_s",
-            ])
+        self._writer = writer
+        self._log_file = log_file
 
     def check_arb(self, event_ticker: str, exchange_ts: str | None):
         ev = self.event_info[event_ticker]
@@ -337,7 +181,7 @@ class ArbMonitor:
         BATCH_SIZE = 100
 
         while True:
-            headers = _ws_auth_headers()
+            headers = ws_auth_headers()
             try:
                 async with websockets.connect(WS_URL, additional_headers = headers) as ws:
                     for i in range(0, len(self.all_tickers), BATCH_SIZE):
@@ -381,30 +225,59 @@ class ArbMonitor:
                 continue
 
     def close(self):
+        """Flush any open arbs as closed rows."""
         now = Timestamp.now()
         for et in list(self.active_arbs.keys()):
             self._close_arb(et, now, None)
-        self._log_file.close()
+
+
+REFRESH_INTERVAL_S = 8 * 3600
 
 
 async def main():
     parser = argparse.ArgumentParser(description = "Monitor top Kalshi events for multi-outcome arbitrage")
-    parser.add_argument("-n", "--top-n", type = int, default = 10, help = "Number of top events by volume")
+    parser.add_argument("-n", "--top-n", type = int, default = 10, help = "Number of top events by 24h volume")
+    parser.add_argument("-c", "--category", type = str, default = "Sports", help = "Event category filter (default: Sports, 'all' to disable)")
+    parser.add_argument("-m", "--max-markets", type = int, default = 10, help = "Skip events with more than this many markets (default: 10)")
     args = parser.parse_args()
 
-    events = discover_top_events(args.top_n)
-    if not events:
-        print("No multivariate events found.")
-        return
+    OUTPUT_DIR.mkdir(parents = True, exist_ok = True)
+    log_path = OUTPUT_DIR / "arb_log.csv"
+    log_file = open(log_path, "a", newline = "")
+    writer = csv.writer(log_file)
+    if log_path.stat().st_size == 0:
+        writer.writerow([
+            "event_ticker", "title", "side",
+            "profit_per_contract", "max_profit_per_contract", "min_qty",
+            "open_local_ts", "open_exchange_ts",
+            "close_local_ts", "close_exchange_ts",
+            "duration_local_s", "duration_exchange_s",
+        ])
+        log_file.flush()
+    print(f"Logging to {log_path}")
 
-    monitor = ArbMonitor(events)
     try:
-        await monitor.run()
+        while True:
+            category = args.category if args.category != "all" else None
+            events = discover_top_events(args.top_n, category = category, max_markets = args.max_markets)
+            if not events:
+                print("No multivariate events found.")
+                return
+
+            monitor = ArbMonitor(events, writer, log_file)
+            try:
+                await asyncio.wait_for(monitor.run(), timeout = REFRESH_INTERVAL_S)
+            except asyncio.TimeoutError:
+                print(f"\n--- Refreshing top {args.top_n} events after {REFRESH_INTERVAL_S // 3600}h ---\n")
+            finally:
+                monitor.close()
     except KeyboardInterrupt:
         print("\nStopping monitor...")
     finally:
-        monitor.close()
+        log_file.close()
 
 
 if __name__ == "__main__":
+    # Treat SIGTERM (from SLURM) like KeyboardInterrupt so finally blocks run
+    signal.signal(signal.SIGTERM, lambda *_: os.kill(os.getpid(), signal.SIGINT))
     asyncio.run(main())

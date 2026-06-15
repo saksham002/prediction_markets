@@ -1,8 +1,13 @@
 """
 Survey of Kalshi exchange: active market/event/series counts,
 volume distributions, and spread statistics bucketed by volume.
+
+Flags:
+  --top-n N   Print top N markets by volume and exit (default 10).
+              Skips full survey when set.
 """
 
+import argparse
 import json
 import time
 from pathlib import Path
@@ -293,5 +298,36 @@ def run_survey():
     print_spread_stats("All", all_spread)
 
 
+def _print_market_table(markets, label):
+    print(f"\n{label}:")
+    print(f"{'#':<4} {'Ticker':<35} {'Volume':>14} {'24h Volume':>14}  Title")
+    print("-" * 125)
+    for i, m in enumerate(markets, 1):
+        vol = float(m["volume_fp"])
+        vol_24h = float(m.get("volume_24h_fp", "0"))
+        title = m.get("title", "")
+        print(f"{i:<4} {m['ticker']:<35} {vol:>14,.0f} {vol_24h:>14,.0f}  {title}")
+
+
+def print_top_markets(n: int):
+    """Fetch all active markets and print top N by total and 24h volume."""
+    print(f"Fetching active markets...")
+    markets = fetch_active_markets()
+    print(f"  {len(markets)} active markets found")
+
+    by_total = sorted(markets, key = lambda m: float(m["volume_fp"]), reverse = True)[:n]
+    by_24h = sorted(markets, key = lambda m: float(m.get("volume_24h_fp", "0")), reverse = True)[:n]
+
+    _print_market_table(by_total, f"Top {n} by total volume")
+    _print_market_table(by_24h, f"Top {n} by 24h volume")
+
+
 if __name__ == "__main__":
-    run_survey()
+    parser = argparse.ArgumentParser(description = "Kalshi exchange survey")
+    parser.add_argument("--top-n", type = int, default = None, help = "Print top N markets by volume and exit (default 10)")
+    args = parser.parse_args()
+
+    if args.top_n is not None:
+        print_top_markets(args.top_n)
+    else:
+        run_survey()

@@ -1,308 +1,269 @@
 """
-Per-second signal logger for top N Kalshi markets.
+Per-minute signal logger for top N Kalshi paired sports markets.
 
-Subscribes to orderbook_delta + trade channels for the highest-volume markets,
-maintains live orderbooks, and runs TradeFillMA at multiple half-lives.
+Subscribes to ticker + trade channels for the highest-volume paired events,
+maintains top-of-book state, and runs TradeFillMA in both single-market and
+pair-market modes at multiple half-lives.
 
-Every second, writes one row per market:
-  local_ts, exchange_ts, ticker, yes_bid, no_bid,
-  tfma_1s_e, tfma_10s_e, tfma_1m_e, tfma_5m_e, tfma_15m_e, tfma_30m_e, tfma_1h_e,
-  tfma_1s_l, tfma_10s_l, tfma_1m_l, tfma_5m_l, tfma_15m_l, tfma_30m_l, tfma_1h_l
+Once per minute, writes one row per still-active market:
+  local_ts, exchange_ts, ticker, event_ticker, pair_position, yes_bid, no_bid,
+  tfma_{hl}_e, tfma_{hl}_l,                       (single-market, raw)
+  tfma_pw_{hl}_e, tfma_pw_{hl}_l,                 (single-market, price-weighted)
+  pair_tfma_{hl}_e, pair_tfma_{hl}_l,             (pair-market, raw)
+  pair_tfma_pw_{hl}_e, pair_tfma_pw_{hl}_l        (pair-market, price-weighted)
 
-(e = exchange time decay, l = local time decay)
+Markets whose close_time has passed are considered resolved and skipped.
 """
 
 import argparse
 import asyncio
-import base64
 import csv
 import json
 import os
+import signal
 import sys
-import time
-from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 import websockets
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding
-from dotenv import load_dotenv
-
-load_dotenv(dotenv_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
 
 # Add project root to path for imports
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from research.signals.pairs import discover_top_pairs
 from research.signals.trade_fill_ma import TradeFillMA, HALF_LIVES_TIME
+from src.utils.api import WS_URL, ws_auth_headers
 from src.utils.timestamp import Timestamp
 
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 OUTPUT_DIR = Path("/data/user_data/saksham3/kalshi/signal_logs")
-
-
-# --- Auth ---
-
-def _load_private_key():
-    pk_path = os.environ["KALSHI_PRIVATE_KEY_PATH"]
-    with open(pk_path, "rb") as f:
-        return serialization.load_pem_private_key(f.read(), password = None)
-
-
-def _sign(private_key, text: str) -> str:
-    signature = private_key.sign(
-        text.encode("utf-8"),
-        padding.PSS(
-            mgf = padding.MGF1(hashes.SHA256()),
-            salt_length = padding.PSS.DIGEST_LENGTH,
-        ),
-        hashes.SHA256(),
-    )
-    return base64.b64encode(signature).decode("utf-8")
-
-
-def _ws_auth_headers():
-    key_id = os.environ["KALSHI_KEY_ID"]
-    private_key = _load_private_key()
-    timestamp_ms = str(int(time.time() * 1000))
-    message = timestamp_ms + "GET" + "/trade-api/ws/v2"
-    signature = _sign(private_key, message)
-    return {
-        "KALSHI-ACCESS-KEY": key_id,
-        "KALSHI-ACCESS-SIGNATURE": signature,
-        "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-    }
-
-
-# --- REST: discover top markets ---
-
-def api_get(url, params = None):
-    for attempt in range(5):
-        resp = requests.get(url, params = params, timeout = 30)
-        if resp.status_code == 429:
-            time.sleep(2 ** attempt)
-            continue
-        resp.raise_for_status()
-        return resp
-    resp.raise_for_status()
-
-
-def paginate(endpoint, params = None, key = None, max_per_page = 1000):
-    if key is None:
-        key = endpoint.strip("/").split("/")[-1]
-    params = dict(params or {})
-    params["limit"] = max_per_page
-    all_items = []
-    cursor = None
-    while True:
-        if cursor:
-            params["cursor"] = cursor
-        data = api_get(f"{BASE_URL}/{endpoint}", params = params).json()
-        items = data.get(key, [])
-        all_items.extend(items)
-        cursor = data.get("cursor", "")
-        if not cursor or not items:
-            break
-        time.sleep(0.15)
-    return all_items
-
-
-def discover_top_markets(n: int) -> list[dict]:
-    """Find top N active markets by volume across all active markets."""
-    print("Fetching all active markets...")
-    all_markets = paginate(
-        "markets",
-        params = {"status": "open"},
-        key = "markets",
-    )
-    print(f"  {len(all_markets)} active markets found")
-
-    all_markets.sort(key = lambda m: float(m["volume_fp"]), reverse = True)
-    top = all_markets[:n]
-
-    for m in top:
-        print(f"  [{m['ticker']}] volume={float(m['volume_fp']):.0f} title={m.get('title', '')[:60]}")
-
-    return top
-
-
-# --- Orderbook state ---
-
-@dataclass
-class BookSide:
-    levels: dict[str, float] = field(default_factory = dict)
-
-    def apply_delta(self, price: str, delta: float):
-        current = self.levels.get(price, 0.0)
-        new_qty = current + delta
-        if new_qty <= 0:
-            self.levels.pop(price, None)
-        else:
-            self.levels[price] = new_qty
-
-    def best_bid(self) -> tuple[float | None, float | None]:
-        if not self.levels:
-            return None, None
-        best_price = max(self.levels.keys(), key = lambda p: float(p))
-        return float(best_price), self.levels[best_price]
-
-    def load_snapshot(self, levels: list[list[str]]):
-        self.levels.clear()
-        for price, qty in levels:
-            q = float(qty)
-            if q > 0:
-                self.levels[price] = q
-
-
-@dataclass
-class MarketBook:
-    yes: BookSide = field(default_factory = BookSide)
-    no: BookSide = field(default_factory = BookSide)
-
-
-# --- Signal Logger ---
 
 HL_LABELS = list(HALF_LIVES_TIME.keys())
 
+LOG_INTERVAL_S = 60
+
+
+@dataclass
+class TickerState:
+    yes_bid: float | None = None
+    no_bid: float | None = None
+    yes_ask: float | None = None
+    no_ask: float | None = None
+    yes_bid_size: float | None = None
+    no_bid_size: float | None = None
+    yes_ask_size: float | None = None
+    no_ask_size: float | None = None
+
 
 class SignalLogger:
-    def __init__(self, markets: list[dict]):
-        self.tickers = [m["ticker"] for m in markets]
-        self.books: dict[str, MarketBook] = defaultdict(MarketBook)
-        self._seq: dict[int, int] = {}
-        # orderbook_delta ts is ISO string, trade ts is unix epoch int
+    def __init__(self, pairs: list[dict], writer: csv.writer, log_file):
+        self.pairs = pairs
+        self.pair_by_ticker: dict[str, str] = {}
+        self.tickers: dict[str, TickerState] = {}
         self._last_exchange_ts: dict[str, int] = {}
 
-        # One TradeFillMA per ticker per time source, each tracking all half-lives
+        # Single-mode TradeFillMA per ticker, pair-mode per event, both time sources
         self._signals_exchange: dict[str, TradeFillMA] = {}
         self._signals_local: dict[str, TradeFillMA] = {}
+        self._pair_signals_exchange: dict[str, TradeFillMA] = {}
+        self._pair_signals_local: dict[str, TradeFillMA] = {}
 
-        for ticker in self.tickers:
-            self._signals_exchange[ticker] = TradeFillMA(
-                ticker,
+        self.all_tickers: list[str] = []
+        self.ticker_close_time: dict[str, Timestamp] = {}
+
+        for pair in pairs:
+            ft = pair["first_ticker"]
+            st = pair["second_ticker"]
+            self.pair_by_ticker[ft] = pair["event_ticker"]
+            self.pair_by_ticker[st] = pair["event_ticker"]
+            self.tickers[ft] = TickerState()
+            self.tickers[st] = TickerState()
+            self.all_tickers.extend([ft, st])
+            self.ticker_close_time[ft] = Timestamp.from_iso(pair["first_close_time"])
+            self.ticker_close_time[st] = Timestamp.from_iso(pair["second_close_time"])
+
+            for ticker in (ft, st):
+                self._signals_exchange[ticker] = TradeFillMA(
+                    ticker,
+                    half_life_seconds = HALF_LIVES_TIME,
+                    time_source = "exchange",
+                )
+                self._signals_local[ticker] = TradeFillMA(
+                    ticker,
+                    half_life_seconds = HALF_LIVES_TIME,
+                    time_source = "local",
+                )
+
+            self._pair_signals_exchange[pair["event_ticker"]] = TradeFillMA(
+                pair_tickers = (ft, st),
                 half_life_seconds = HALF_LIVES_TIME,
                 time_source = "exchange",
             )
-            self._signals_local[ticker] = TradeFillMA(
-                ticker,
+            self._pair_signals_local[pair["event_ticker"]] = TradeFillMA(
+                pair_tickers = (ft, st),
                 half_life_seconds = HALF_LIVES_TIME,
                 time_source = "local",
             )
 
-        # CSV setup
-        OUTPUT_DIR.mkdir(parents = True, exist_ok = True)
-        ts_str = Timestamp.now().et.strftime("%Y%m%d_%H%M%S")
-        log_path = OUTPUT_DIR / f"signal_log_{ts_str}.csv"
-        self._log_file = open(log_path, "w", newline = "")
-        self._writer = csv.writer(self._log_file)
+        self._writer = writer
+        self._log_file = log_file
 
-        header = ["local_ts", "exchange_ts", "ticker", "yes_bid", "no_bid"]
-        for label in HL_LABELS:
-            header.append(f"tfma_{label}_e")
-        for label in HL_LABELS:
-            header.append(f"tfma_{label}_l")
-        self._writer.writerow(header)
+    def _market_closed(self, ticker: str, now_epoch: float | None = None) -> bool:
+        if now_epoch is None:
+            now_epoch = Timestamp.now().epoch
+        return now_epoch >= self.ticker_close_time[ticker].epoch
 
-        print(f"Logging to {log_path}")
-
-    def _handle_snapshot(self, msg: dict):
+    def _handle_ticker(self, msg: dict):
         ticker = msg["market_ticker"]
-        book = self.books[ticker]
-        book.yes.load_snapshot(msg.get("yes_dollars_fp", []))
-        book.no.load_snapshot(msg.get("no_dollars_fp", []))
-
-    def _handle_delta(self, msg: dict):
-        ticker = msg["market_ticker"]
-        book = self.books[ticker]
-        side = book.yes if msg["side"] == "yes" else book.no
-        side.apply_delta(msg["price_dollars"], float(msg["delta_fp"]))
-        # orderbook_delta ts is ISO — convert to epoch for consistent storage
+        if ticker not in self.tickers:
+            return
+        if self._market_closed(ticker):
+            return
+        state = self.tickers[ticker]
+        if "yes_bid_dollars" in msg:
+            yb = msg["yes_bid_dollars"]
+            state.yes_bid = float(yb) if yb else None
+        if "no_bid_dollars" in msg:
+            nb = msg["no_bid_dollars"]
+            state.no_bid = float(nb) if nb else None
+        if "yes_ask_dollars" in msg:
+            ya = msg["yes_ask_dollars"]
+            state.yes_ask = float(ya) if ya else None
+        if "no_ask_dollars" in msg:
+            na = msg["no_ask_dollars"]
+            state.no_ask = float(na) if na else None
+        if "yes_bid_size_fp" in msg:
+            ybs = msg["yes_bid_size_fp"]
+            state.yes_bid_size = float(ybs) if ybs else None
+        if "no_bid_size_fp" in msg:
+            nbs = msg["no_bid_size_fp"]
+            state.no_bid_size = float(nbs) if nbs else None
+        if "yes_ask_size_fp" in msg:
+            yas = msg["yes_ask_size_fp"]
+            state.yes_ask_size = float(yas) if yas else None
+        if "no_ask_size_fp" in msg:
+            nas = msg["no_ask_size_fp"]
+            state.no_ask_size = float(nas) if nas else None
         ts = msg.get("ts")
         if ts:
-            self._last_exchange_ts[ticker] = int(Timestamp.from_iso(ts).epoch)
+            self._last_exchange_ts[ticker] = int(ts)
 
     def _handle_trade(self, msg: dict):
         """Trade msg ts is unix epoch int."""
         ticker = msg["market_ticker"]
         if ticker not in self._signals_exchange:
             return
-        ts = msg.get("ts")
-        if ts is not None:
-            self._last_exchange_ts[ticker] = int(ts)
+        if self._market_closed(ticker):
+            return
+        self._last_exchange_ts[ticker] = int(msg["ts"])
+
         self._signals_exchange[ticker].on_message("trade", msg)
         self._signals_local[ticker].on_message("trade", msg)
 
+        event_ticker = self.pair_by_ticker[ticker]
+        self._pair_signals_exchange[event_ticker].on_message("trade", msg)
+        self._pair_signals_local[event_ticker].on_message("trade", msg)
+
     def _write_snapshot(self):
-        """Write one row per ticker with current state."""
+        """Write one row per still-active ticker with current state."""
         local_ts = Timestamp.now()
 
-        for ticker in self.tickers:
-            book = self.books[ticker]
-            yes_bid_price, _ = book.yes.best_bid()
-            no_bid_price, _ = book.no.best_bid()
+        for pair in self.pairs:
+            event_ticker = pair["event_ticker"]
+            pair_exchange_vals = self._pair_signals_exchange[event_ticker].values()
+            pair_local_vals = self._pair_signals_local[event_ticker].values()
+            pair_exchange_pw = self._pair_signals_exchange[event_ticker].values_pw()
+            pair_local_pw = self._pair_signals_local[event_ticker].values_pw()
 
-            exchange_epoch = self._last_exchange_ts.get(ticker)
-            if exchange_epoch is not None:
-                exchange_str = Timestamp(exchange_epoch).readable()
-            else:
-                exchange_str = ""
+            for idx, ticker in enumerate((pair["first_ticker"], pair["second_ticker"])):
+                if self._market_closed(ticker, now_epoch = local_ts.epoch):
+                    continue
+                state = self.tickers[ticker]
+                yes_bid_price = state.yes_bid
+                no_bid_price = state.no_bid
 
-            row = [
-                local_ts.readable(),
-                exchange_str,
-                ticker,
-                f"{yes_bid_price:.4f}" if yes_bid_price is not None else "",
-                f"{no_bid_price:.4f}" if no_bid_price is not None else "",
-            ]
+                exchange_epoch = self._last_exchange_ts.get(ticker)
+                if exchange_epoch is not None:
+                    exchange_str = Timestamp(exchange_epoch).readable()
+                else:
+                    exchange_str = ""
 
-            exchange_vals = self._signals_exchange[ticker].values()
-            local_vals = self._signals_local[ticker].values()
-            for label in HL_LABELS:
-                v = exchange_vals[label]
-                row.append(f"{v:.6f}" if v is not None else "")
-            for label in HL_LABELS:
-                v = local_vals[label]
-                row.append(f"{v:.6f}" if v is not None else "")
+                pair_position = "first" if idx == 0 else "second"
 
-            self._writer.writerow(row)
+                row = [
+                    local_ts.readable(),
+                    exchange_str,
+                    ticker,
+                    event_ticker,
+                    pair_position,
+                    f"{yes_bid_price:.4f}" if yes_bid_price is not None else "",
+                    f"{no_bid_price:.4f}" if no_bid_price is not None else "",
+                ]
+
+                exchange_vals = self._signals_exchange[ticker].values()
+                local_vals = self._signals_local[ticker].values()
+                exchange_pw = self._signals_exchange[ticker].values_pw()
+                local_pw = self._signals_local[ticker].values_pw()
+                for label in HL_LABELS:
+                    v = exchange_vals[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+                for label in HL_LABELS:
+                    v = local_vals[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+                for label in HL_LABELS:
+                    v = exchange_pw[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+                for label in HL_LABELS:
+                    v = local_pw[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+                for label in HL_LABELS:
+                    v = pair_exchange_vals[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+                for label in HL_LABELS:
+                    v = pair_local_vals[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+                for label in HL_LABELS:
+                    v = pair_exchange_pw[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+                for label in HL_LABELS:
+                    v = pair_local_pw[label]
+                    row.append(f"{v:.6f}" if v is not None else "")
+
+                self._writer.writerow(row)
 
         self._log_file.flush()
 
     async def _periodic_log(self):
-        """Write snapshot every second."""
+        """Write snapshot every LOG_INTERVAL_S seconds."""
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(LOG_INTERVAL_S)
             self._write_snapshot()
 
     async def run(self):
         print(f"Connecting to {WS_URL}...")
-        print(f"Monitoring {len(self.tickers)} markets")
+        print(f"Monitoring {len(self.pairs)} events, {len(self.all_tickers)} markets")
 
         BATCH_SIZE = 100
 
         while True:
-            headers = _ws_auth_headers()
+            headers = ws_auth_headers()
             try:
                 async with websockets.connect(WS_URL, additional_headers = headers) as ws:
-                    # Subscribe to orderbook_delta
-                    for i in range(0, len(self.tickers), BATCH_SIZE):
-                        batch = self.tickers[i : i + BATCH_SIZE]
+                    for i in range(0, len(self.all_tickers), BATCH_SIZE):
+                        batch = self.all_tickers[i : i + BATCH_SIZE]
                         sub = {
                             "id": i // BATCH_SIZE + 1,
                             "cmd": "subscribe",
                             "params": {
-                                "channels": ["orderbook_delta"],
+                                "channels": ["ticker"],
                                 "market_tickers": batch,
                             },
                         }
                         await ws.send(json.dumps(sub))
-                        print(f"  Subscribed orderbook_delta batch {i // BATCH_SIZE + 1}: {len(batch)} tickers")
+                        print(f"  Subscribed ticker batch {i // BATCH_SIZE + 1}: {len(batch)} tickers")
 
-                    # Subscribe to trade channel
-                    for i in range(0, len(self.tickers), BATCH_SIZE):
-                        batch = self.tickers[i : i + BATCH_SIZE]
+                    for i in range(0, len(self.all_tickers), BATCH_SIZE):
+                        batch = self.all_tickers[i : i + BATCH_SIZE]
                         sub = {
                             "id": 1000 + i // BATCH_SIZE + 1,
                             "cmd": "subscribe",
@@ -314,61 +275,106 @@ class SignalLogger:
                         await ws.send(json.dumps(sub))
                         print(f"  Subscribed trade batch {i // BATCH_SIZE + 1}: {len(batch)} tickers")
 
-                    print("Listening and logging every second...\n")
+                    print(f"Listening and logging every {LOG_INTERVAL_S}s...\n")
 
                     log_task = asyncio.create_task(self._periodic_log())
+                    try:
+                        async for raw in ws:
+                            data = json.loads(raw)
+                            msg_type = data.get("type")
 
-                    async for raw in ws:
-                        data = json.loads(raw)
-                        msg_type = data.get("type")
+                            if msg_type == "ticker":
+                                self._handle_ticker(data["msg"])
+                            elif msg_type == "trade":
+                                self._handle_trade(data["msg"])
+                            elif msg_type == "error":
+                                print(f"  Server error: {data}")
+                    finally:
+                        log_task.cancel()
+                        try:
+                            await log_task
+                        except asyncio.CancelledError:
+                            pass
 
-                        if msg_type == "orderbook_snapshot":
-                            sid = data["sid"]
-                            self._seq[sid] = data["seq"]
-                            self._handle_snapshot(data["msg"])
-
-                        elif msg_type == "orderbook_delta":
-                            sid = data["sid"]
-                            expected = self._seq.get(sid, 0) + 1
-                            actual = data["seq"]
-                            if actual != expected:
-                                print(f"  Seq gap sid={sid}: expected {expected}, got {actual}")
-                            self._seq[sid] = actual
-                            self._handle_delta(data["msg"])
-
-                        elif msg_type == "trade":
-                            self._handle_trade(data["msg"])
-
-                        elif msg_type == "error":
-                            print(f"  Server error: {data}")
-
-            except websockets.ConnectionClosed as e:
-                print(f"Connection closed ({e.code}), reconnecting...")
-                log_task.cancel()
+            except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+                print(f"Connection error ({type(e).__name__}: {e}), reconnecting in 5s...")
+                await asyncio.sleep(5)
                 continue
-
-    def close(self):
-        self._log_file.close()
 
 
 async def main():
-    parser = argparse.ArgumentParser(description = "Per-second signal logger for top Kalshi markets")
-    parser.add_argument("-n", "--top-n", type = int, default = 20, help = "Number of top markets by volume")
+    parser = argparse.ArgumentParser(description = "Per-minute signal logger for top Kalshi paired sports markets")
+    parser.add_argument("-n", "--top-n", type = int, default = 10, help = "Number of top sports pairs")
+    parser.add_argument("-c", "--category", type = str, default = "Sports", help = "Event category")
+    parser.add_argument("-r", "--rerank-interval", type = float, default = 8, help = "Re-rank pairs every this many hours (default: 8)")
+    parser.add_argument("-d", "--duration", type = float, default = None, help = "Run for this many hours then exit cleanly (default: run until killed)")
     args = parser.parse_args()
 
-    markets = discover_top_markets(args.top_n)
-    if not markets:
-        print("No active markets found.")
-        return
+    OUTPUT_DIR.mkdir(parents = True, exist_ok = True)
+    ts_str = Timestamp.now().et.strftime("%Y%m%d_%H%M%S")
+    log_path = OUTPUT_DIR / f"signal_log_{ts_str}.csv"
+    log_file = open(log_path, "w", newline = "")
+    writer = csv.writer(log_file)
 
-    logger = SignalLogger(markets)
+    header = ["local_ts", "exchange_ts", "ticker", "event_ticker", "pair_position", "yes_bid", "no_bid"]
+    for label in HL_LABELS:
+        header.append(f"tfma_{label}_e")
+    for label in HL_LABELS:
+        header.append(f"tfma_{label}_l")
+    for label in HL_LABELS:
+        header.append(f"tfma_pw_{label}_e")
+    for label in HL_LABELS:
+        header.append(f"tfma_pw_{label}_l")
+    for label in HL_LABELS:
+        header.append(f"pair_tfma_{label}_e")
+    for label in HL_LABELS:
+        header.append(f"pair_tfma_{label}_l")
+    for label in HL_LABELS:
+        header.append(f"pair_tfma_pw_{label}_e")
+    for label in HL_LABELS:
+        header.append(f"pair_tfma_pw_{label}_l")
+    writer.writerow(header)
+    log_file.flush()
+    print(f"Logging to {log_path}")
+
+    rerank_s = args.rerank_interval * 3600
+    duration_s = args.duration * 3600 if args.duration is not None else None
+    start_epoch = Timestamp.now().epoch
+
     try:
-        await logger.run()
+        while True:
+            elapsed = Timestamp.now().epoch - start_epoch
+            if duration_s is not None and elapsed >= duration_s:
+                break
+
+            while True:
+                try:
+                    pairs = discover_top_pairs(args.top_n, args.category)
+                    break
+                except requests.exceptions.RequestException as e:
+                    print(f"discover_top_pairs failed ({type(e).__name__}: {e}), retrying in 60s...")
+                    await asyncio.sleep(60)
+            if not pairs:
+                print("No matching sports pairs found.")
+                return
+
+            logger = SignalLogger(pairs, writer, log_file)
+            this_iter_timeout = rerank_s
+            if duration_s is not None:
+                this_iter_timeout = min(rerank_s, duration_s - elapsed)
+            try:
+                await asyncio.wait_for(logger.run(), timeout = this_iter_timeout)
+            except asyncio.TimeoutError:
+                if duration_s is not None and (Timestamp.now().epoch - start_epoch) >= duration_s:
+                    print(f"\n--- Duration {args.duration}h elapsed, exiting ---\n")
+                    break
+                print(f"\n--- Re-ranking top {args.top_n} pairs after {args.rerank_interval}h ---\n")
     except KeyboardInterrupt:
         print("\nStopping logger...")
     finally:
-        logger.close()
+        log_file.close()
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, lambda *_: os.kill(os.getpid(), signal.SIGINT))
     asyncio.run(main())
