@@ -31,13 +31,18 @@ Prices are 4-decimal dollar strings to match book level keys exactly.
 
 from dataclasses import dataclass, field
 
+from src.utils.feps import is_pos, lte
+
 PENDING_WINDOW_S = 1.0
 # One-way order-entry latency to Kalshi. An order decided at local time P is
 # live on the book at P + FORWARD_DELAY_S; only trades matched after that can
 # fill us: fill iff placed_lts + forward_delay <= trade ts. Measured June 2026
 # from babel (measure_latency.py): WS ping RTT median 35.6ms -> one-way ~18ms;
 # feed receive offset median +19ms; exchange ts_ms verified Unix-epoch match
-# time with negligible clock offset. Default rounds up to 20ms.
+# time with negligible clock offset. Measured forward (send->created): AWS
+# us-east colocated 14.2ms, babel 24.7ms (aws_probe.py --feed-lag). Default set
+# to a CONSERVATIVE 20ms (user directive) — between colocated and babel, errs
+# toward fewer/later fills rather than optimistic capture.
 FORWARD_DELAY_S = 0.020
 CROSS_GRACE_S = 0.5
 
@@ -118,7 +123,7 @@ class PassiveFillEngine:
         return [self.orders[oid] for oid in self._by_ticker.get(ticker, ())]
 
     def _remove_filled(self, order: RestingOrder):
-        if order.remaining <= 0:
+        if lte(order.remaining, 0):
             self.cancel(order.order_id)
 
     def _crossing_qty(self, order: RestingOrder) -> float | None:
@@ -136,7 +141,7 @@ class PassiveFillEngine:
             implied_ask = round(1.0 - float(price_str), 6)  # in our price space
             if implied_ask <= order.price_f + 1e-9:
                 total += qty
-        return total if total > 0 else None
+        return total if is_pos(total) else None
 
     def _pending_total(self, lts: float, level_key: tuple) -> float:
         """Expire old entries, return remaining pending reduction at level."""
@@ -184,7 +189,7 @@ class PassiveFillEngine:
                     # The crossing order fills the real queue ahead of us first;
                     # only its overflow reaches our simulated order.
                     fill_qty = min(order.remaining, max(0.0, crossing_qty - order.queue_ahead))
-                    if fill_qty > 0:
+                    if is_pos(fill_qty):
                         order.filled += fill_qty
                         fills.append(Fill(lts = lts, order = order, qty = fill_qty, reason = "cross"))
                         self._remove_filled(order)
@@ -217,11 +222,11 @@ class PassiveFillEngine:
         # whether any order predates the trade — the delta was this trade)
         remaining_explain = trade_qty
         entries = self._pending.get(level_key, [])
-        while entries and remaining_explain > 0:
+        while entries and is_pos(remaining_explain):
             consumed = min(entries[0][1], remaining_explain)
             entries[0][1] -= consumed
             remaining_explain -= consumed
-            if entries[0][1] <= 0:
+            if lte(entries[0][1], 0):
                 entries.pop(0)
         if not entries and level_key in self._pending:
             del self._pending[level_key]
@@ -234,9 +239,9 @@ class PassiveFillEngine:
                 continue
             overflow = trade_qty - order.queue_ahead
             order.queue_ahead = max(0.0, order.queue_ahead - trade_qty)
-            if overflow > 0:
+            if is_pos(overflow):
                 fill_qty = min(overflow, order.remaining)
-                if fill_qty > 0:
+                if is_pos(fill_qty):
                     order.filled += fill_qty
                     fills.append(Fill(lts = lts, order = order, qty = fill_qty, reason = "trade"))
                     self._remove_filled(order)

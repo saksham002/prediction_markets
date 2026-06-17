@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from arb_sim import run_one
 from research.hft.replay import Replayer
 from research.hft.espn_clock import clocks_for
+from research.hft.passive_fill import FORWARD_DELAY_S
 
 DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
 OUT = Path("/home/saksham3/projects/personal/prediction_markets/plots/arb_pnl_sweep.csv")
@@ -26,7 +27,7 @@ LS = [3, 4, 5, 6, 7]
 
 
 def cfg(t, l):
-    return SimpleNamespace(t_ms = t, levels = l, mode = "trade", latency = 0.020,
+    return SimpleNamespace(t_ms = t, levels = l, mode = "trade", latency = FORWARD_DELAY_S,
                            budget = 1000.0, per_event_cap = 100.0, margin = 0.02,
                            cap_levels = 10, liq_timeout = 30.0, series = "KXWCGAME")
 

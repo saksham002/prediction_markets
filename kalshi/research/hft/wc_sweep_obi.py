@@ -1,7 +1,8 @@
 """Restricted WC FootballStrategy sweep: OBI ONLY (no gating) under a real
 $1000 deployed-capital budget. Unlike wc_sweep.py (budget off -> position limit
 binds), here the global deployed-dollars cap is the deploy-realistic $1000, so
-capital is the binding constraint. In-sample = first 4 WC games, out = last 4.
+capital is the binding constraint. Train = first 6 WC games (chronological), test
+= next 6 (chronological train-test split).
 
 Usage: wc_sweep_obi.py --shard I --num-shards N   |   wc_sweep_obi.py --collect
 """
@@ -14,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from eval_buffer import run_one
 
 DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
-RESULTS = Path("/data/user_data/saksham3/kalshi_hft/sims/wc_sweep_obi")
-BEST_CFG = Path("/data/user_data/saksham3/kalshi_hft/studies/wc_obi_budget_best_config.json")
+RESULTS = Path("/data/user_data/saksham3/kalshi_hft/sims/wc_sweep_obi_66")
+BEST_CFG = Path("/data/user_data/saksham3/kalshi_hft/studies/wc_obi_budget_best_config_66.json")
 BUDGET = 1000.0   # real $1000 deployed-capital cap -> capital is the binding constraint
 
 # obi |alpha| percentiles {50,75,90,95,99} (same wc_thresholds.json as the full
@@ -50,7 +51,7 @@ def _agg(games, cfg):
 def run_shard(shard, n):
     RESULTS.mkdir(parents = True, exist_ok = True)
     games = wc_games()
-    inn, out = games[:4], games[4:8]
+    inn, out = games[:6], games[6:12]    # train = first 6 chronologically, test = next 6
     for idx, (label, alpha, thr, s, cap) in enumerate(COMBOS):
         if idx % n != shard:
             continue

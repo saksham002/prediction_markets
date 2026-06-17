@@ -31,6 +31,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine, market_obi
 from research.hft.passive_fill import FORWARD_DELAY_S, PassiveFillEngine, price_key
+from src.utils.feps import is_pos, is_neg, is_zero, gte, lte
 from research.hft.replay import Replayer
 from src.pnl import PnL
 
@@ -109,6 +110,21 @@ class PairMM:
             return {"no": [(round(1.0 - px, 6), min(p.per_order_size, tkr_inv))]}
         return {}
 
+    def _liquidate_quotes(self, ticker: str) -> dict:
+        """Reduce-only passive quotes (NO alpha, NO price-band restriction) to
+        work out of a non-zero position when the touch is outside [price_min,
+        price_max] and normal alpha-MM is suppressed. {} when flat."""
+        tob = self._leg_tob(ticker)
+        if tob.yes_bid is None or tob.yes_ask is None:
+            return {}
+        inv = self.inventory[ticker]
+        S = self.params.per_order_size
+        if is_neg(inv):                       # short yes -> bid to cover at the touch
+            return {"yes": [(tob.yes_bid, min(S, -inv))]}
+        if is_pos(inv):                       # long yes -> offer to sell at the touch
+            return {"no": [(round(1.0 - tob.yes_ask, 6), min(S, inv))]}
+        return {}
+
     def _desired_sides(self, ticker: str, leg_alpha: float, lts: float = 0.0) -> dict:
         """Map of side -> [(price, size)] quotes to rest, per the skew rules."""
         p = self.params
@@ -131,7 +147,9 @@ class PairMM:
         if tob.spread < 0.005:
             return {}
         if tob.yes_bid < p.price_min or tob.yes_ask > p.price_max:
-            return {}
+            # outside the quotable band: no alpha MM, but still work out of any
+            # open position (reduce-only, no alpha); {} when flat
+            return self._liquidate_quotes(ticker)
 
         # Global budget guard. Note cross-leg "reducing" fills still consume
         # cash (locked pairs), so over budget we allow ONLY same-ticker
@@ -161,9 +179,9 @@ class PairMM:
         # instant queue priority (still passive; capture = spread - 1 tick).
         # Prefer the inventory-reducing side, else the alpha-favored side.
         if p.improve and tob.spread >= 0.019:
-            if inv > 0:
+            if is_pos(inv):
                 improve_side = "no"
-            elif inv < 0:
+            elif is_neg(inv):
                 improve_side = "yes"
             elif leg_alpha >= p.skew_threshold:
                 improve_side = "yes"
@@ -196,7 +214,7 @@ class PairMM:
         def shape(side: str, price: float | None, sz: float) -> list[tuple[float, float]]:
             if price is None:
                 return []
-            adding = (side == "yes" and inv >= 0) or (side == "no" and inv <= 0)
+            adding = (side == "yes" and gte(inv, 0)) or (side == "no" and lte(inv, 0))
             floor = p.price_min if side == "yes" else 1.0 - p.price_max
             deeper = round(price - 0.01, 6)
             if adding and ladder and deeper >= floor - 1e-9:
@@ -211,9 +229,9 @@ class PairMM:
             # Only same-ticker netting frees cash; cap size at the open
             # position so the net never flips into new (cash-consuming) risk
             tkr_inv = self.inventory[ticker]
-            if tkr_inv < 0 and yes_price is not None:
+            if is_neg(tkr_inv) and yes_price is not None:
                 return {"yes": [(yes_price, min(size, -tkr_inv))]}
-            if tkr_inv > 0 and no_price is not None:
+            if is_pos(tkr_inv) and no_price is not None:
                 return {"no": [(no_price, min(size, tkr_inv))]}
             return {}
 
@@ -225,12 +243,12 @@ class PairMM:
         square_off = getattr(p, "square_off", False)
         desired = {}
         add_yes = leg_alpha > -p.skew_threshold and inv + S <= p.inventory_cap
-        reduce_yes = square_off and inv < 0
+        reduce_yes = square_off and is_neg(inv)
         if yes_price is not None and (add_yes or reduce_yes):
             sz = size if add_yes else min(size, -inv)
             desired["yes"] = shape("yes", yes_price, sz)
         add_no = leg_alpha < p.skew_threshold and inv - S >= -p.inventory_cap
-        reduce_no = square_off and inv > 0
+        reduce_no = square_off and is_pos(inv)
         if no_price is not None and (add_no or reduce_no):
             sz = size if add_no else min(size, inv)
             desired["no"] = shape("no", no_price, sz)
@@ -270,7 +288,10 @@ class PairMM:
                     order = fill_engine.orders.get(oid)
                     if order is None:
                         continue
-                    if order.price in want_by_key:
+                    # Passive invariant: only rest where real liquidity backs the
+                    # level; a level emptied by a cancel is unsupported -> pull it
+                    supported = is_pos(fill_engine.displayed(ticker, side, order.price))
+                    if supported and order.price in want_by_key:
                         kept.append(oid)               # keep queue position
                         del want_by_key[order.price]
                     elif limiter.try_acquire(lts):
@@ -284,6 +305,10 @@ class PairMM:
                                                 order.price_f, order.remaining, leg_alpha,
                                                 order.queue_ahead, expo)
                 for pk, size in want_by_key.items():
+                    # Passive invariant: never create a price level with no real
+                    # backing (displayed <= 0, e.g. an improve-inside quote)
+                    if lte(fill_engine.displayed(ticker, side, pk), 0):
+                        continue
                     # Queue-depth guard: a fresh join behind a huge displayed
                     # queue only fills when the level breaks (worst selection)
                     if max_queue is not None and fill_engine.displayed(ticker, side, pk) > max_queue:
@@ -312,7 +337,7 @@ class PairMM:
             self.inventory[ticker] -= fill.qty
             yes_space_price = round(1.0 - price, 6)
             self.consumer.pnl.trade(ticker, "short", fill.qty, yes_space_price, is_maker = True)
-        if order.remaining <= 0:
+        if lte(order.remaining, 0):
             key = (ticker, order.side)
             oids = [oid for oid in self.resting.get(key, []) if oid != order.order_id]
             if oids:
@@ -348,7 +373,8 @@ class SingleMM:
         self.params = params
         self.alpha_engine = SingleAlphaEngine(
             ticker, consumer.replayer.books, combo = getattr(params, "combo", None),
-            track_agg = "agg" in params.alpha_name)
+            track_agg = "agg" in params.alpha_name,
+            track_obi_ma = ("obi_ma" in params.alpha_name or "obi_dev" in params.alpha_name))
         self.inventory: dict[str, float] = {ticker: 0.0}
         self.resting: dict[tuple[str, str], list[int]] = {}
         self._latch = 0  # aggro-entry hysteresis direction
@@ -374,6 +400,7 @@ class SingleMM:
     # Reuse PairMM quoting/booking logic with per-market settings
     _desired_sides = PairMM._desired_sides
     _exit_quotes = PairMM._exit_quotes
+    _liquidate_quotes = PairMM._liquidate_quotes
     on_fill = PairMM.on_fill
 
     def _aggro_entry(self, lts: float, alpha: float):
@@ -382,14 +409,14 @@ class SingleMM:
         Exits are handled by the passive reduce-only quotes."""
         p = self.params
         inv = self.inventory[self.ticker]
-        if inv == 0:
+        if is_zero(inv):
             self._entry_px = None
         elif self._entry_px is not None:
             # Stop loss: price moved aggro_stop against entry -> take the touch
             tob = self._leg_tob(self.ticker)
-            stop_long = (inv > 0 and tob.yes_bid is not None
+            stop_long = (is_pos(inv) and tob.yes_bid is not None
                          and tob.yes_bid <= self._entry_px - p.aggro_stop + 1e-9)
-            stop_short = (inv < 0 and tob.yes_ask is not None
+            stop_short = (is_neg(inv) and tob.yes_ask is not None
                           and tob.yes_ask >= self._entry_px + p.aggro_stop - 1e-9)
             if (stop_long or stop_short) and self.consumer.rate_limiter.try_acquire(lts):
                 if stop_long:
@@ -409,7 +436,7 @@ class SingleMM:
                                                 "taker_stop", tob.yes_ask, qty, alpha, None,
                                                 self.inventory[self.ticker])
                 self._armed = False
-                if self.inventory[self.ticker] == 0:
+                if is_zero(self.inventory[self.ticker]):
                     self._entry_px = None
                 return
         if getattr(p, "aggro_cross", False):
@@ -481,7 +508,7 @@ class SingleMM:
             qty = min(p.aggro_limit - inv, tob.yes_ask_qty or 0.0)
             price = tob.yes_ask
             cost = qty * price
-            if qty <= 0 or (budget and self.consumer._deployed_dollars() + cost > budget):
+            if lte(qty, 0) or (budget and self.consumer._deployed_dollars() + cost > budget):
                 return
             self.consumer.pnl.trade(self.ticker, "long", qty, price, is_maker = False)
             self.inventory[self.ticker] += qty
@@ -489,12 +516,12 @@ class SingleMM:
             qty = min(p.aggro_limit + inv, tob.yes_bid_qty or 0.0)
             price = tob.yes_bid
             cost = qty * (1.0 - price)
-            if qty <= 0 or (budget and self.consumer._deployed_dollars() + cost > budget):
+            if lte(qty, 0) or (budget and self.consumer._deployed_dollars() + cost > budget):
                 return
             self.consumer.pnl.trade(self.ticker, "short", qty, price, is_maker = False)
             self.inventory[self.ticker] -= qty
         prev = abs(inv)
-        if self._entry_px is None or prev == 0:
+        if self._entry_px is None or is_zero(prev):
             self._entry_px = price
         else:
             self._entry_px = (self._entry_px * prev + price * qty) / (prev + qty)
@@ -526,7 +553,8 @@ class SingleMM:
                 order = fill_engine.orders.get(oid)
                 if order is None:
                     continue
-                if order.price in want_by_key:
+                supported = is_pos(fill_engine.displayed(self.ticker, side, order.price))
+                if supported and order.price in want_by_key:
                     kept.append(oid)
                     del want_by_key[order.price]
                 elif limiter.try_acquire(lts):
@@ -540,6 +568,8 @@ class SingleMM:
                                             order.price_f, order.remaining, alpha,
                                             order.queue_ahead, expo)
             for pk, size in want_by_key.items():
+                if lte(fill_engine.displayed(self.ticker, side, pk), 0):
+                    continue                            # don't create a non-existent level
                 if max_queue is not None and fill_engine.displayed(self.ticker, side, pk) > max_queue:
                     continue
                 if not limiter.try_acquire(lts):
@@ -618,7 +648,7 @@ class WCStrategy(SingleMM):
         alpha = self.alpha_engine.value_of(self.params.alpha_name, lts)
         alpha = 0.0 if alpha is None else alpha
         inv = self.inventory[self.ticker]
-        support = (inv > 1e-9 and alpha <= 0) or (inv < -1e-9 and alpha >= 0)
+        support = (is_pos(inv) and alpha <= 0) or (is_neg(inv) and alpha >= 0)
         if not support:
             self._cancel_all(lts)
             return
@@ -795,12 +825,23 @@ class MMSimConsumer:
             mm.alpha_engine.on_delta(lts, ticker, delta_msg)
             fills = self.fill_engine.on_book(lts, ticker)
         # Order decisions only when the quote moved (or we got filled);
-        # deep-book deltas update the fill engine but trigger no requote
+        # deep-book deltas update the fill engine but trigger no requote --
+        # EXCEPT a reduction that empties a level where we rest, so the strategy
+        # can pull an order left at an unsupported (no-real-backing) level.
         tob = self.replayer.top(ticker)
         quote = (tob.yes_bid, tob.yes_ask)
         moved = quote != self._last_quote.get(ticker)
         self._last_quote[ticker] = quote
-        if not (moved or fills):
+        rest_emptied = False
+        if delta_msg is not None and float(delta_msg["delta_fp"]) < 0:
+            dside, dpk = delta_msg["side"], delta_msg["price_dollars"]
+            if lte(self.fill_engine.displayed(ticker, dside, dpk), 0):
+                for oid in mm.resting.get((ticker, dside), []):
+                    o = self.fill_engine.orders.get(oid)
+                    if o is not None and o.price == dpk:
+                        rest_emptied = True
+                        break
+        if not (moved or fills or rest_emptied):
             return
         self._record_mid(lts, ticker)
         mm.alpha_engine.on_book(lts, ticker)

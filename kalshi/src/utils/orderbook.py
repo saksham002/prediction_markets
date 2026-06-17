@@ -4,6 +4,8 @@ Orderbook state management for Kalshi markets.
 
 from dataclasses import dataclass, field
 
+from src.utils.feps import is_pos, lte
+
 
 @dataclass
 class BookSide:
@@ -26,7 +28,7 @@ class BookSide:
         new_qty = current + delta
         # Epsilon: fractional count_fp quantities leave float residue (e.g.
         # 0.1 + 0.2 - 0.3 > 0) that would linger as phantom zero-qty levels
-        if new_qty <= 1e-9:
+        if lte(new_qty, 0):
             self.levels.pop(price, None)
             if price == self._best_key:
                 self._rescan_best()
@@ -45,7 +47,7 @@ class BookSide:
         self.levels.clear()
         for price, qty in levels:
             q = float(qty)
-            if q > 0:
+            if is_pos(q):
                 self.levels[price] = q
         self._rescan_best()
 

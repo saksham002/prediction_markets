@@ -27,6 +27,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.mm_sim import MMSimConsumer, compute_markouts, MARKOUT_HORIZONS_S
 from research.hft.replay import Replayer
+from research.hft.passive_fill import FORWARD_DELAY_S
 
 TICKS_DIR = Path("/data/user_data/saksham3/kalshi_hft/ticks")
 PARAM_DEFAULTS = {
@@ -41,7 +42,7 @@ PARAM_DEFAULTS = {
     "pair_risk": True,
     "square_off": False,
     "combo": None,
-    "forward_delay": 0.020,
+    "forward_delay": FORWARD_DELAY_S,
     "size_ref": None,
     "max_queue_ahead": None,
     "depth_quote": False,

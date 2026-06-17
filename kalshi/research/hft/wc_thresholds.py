@@ -1,5 +1,6 @@
-"""Compute |alpha| percentiles {50,75,90,95,99} on the FIRST 4 WC games
-(in-sample) for obi / agg_300s / tfma_pw_300s / agree_agg, sampled at the
+"""Compute |alpha| percentiles {50,75,90,95,99} on the FIRST 8 WC games
+(in-sample / train, chronological) for obi / agg_ratio_300s / tfma_pw_ratio_300s
+/ obi_dev_{5s,60s,300s} (normalized flow + obi-deviation alphas), sampled at the
 1Hz grid. Written to studies/wc_thresholds.json for the WC sweep."""
 import json
 import sys
@@ -14,7 +15,8 @@ from research.hft.replay import Replayer
 
 DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
 OUT = Path("/data/user_data/saksham3/kalshi_hft/studies/wc_thresholds.json")
-ALPHAS = ["obi", "agg_300s", "tfma_pw_300s", "agree_agg"]
+ALPHAS = ["obi", "agg_ratio_300s", "tfma_pw_ratio_300s",
+          "obi_dev_5s", "obi_dev_60s", "obi_dev_300s"]
 PCTS = [50, 75, 90, 95, 99]
 
 
@@ -53,7 +55,7 @@ class ThreshConsumer:
 
 
 def main():
-    games = sorted(DATASET.glob("KXWCGAME*.jsonl.gz"))[:4]
+    games = sorted(DATASET.glob("KXWCGAME*.jsonl.gz"))[:8]
     print("in-sample games:", [g.stem.replace(".jsonl", "") for g in games])
     allvals = defaultdict(list)
     for g in games:

@@ -17,6 +17,7 @@ import time
 from typing import Optional
 
 from .base import Alpha
+from src.utils.feps import is_pos
 
 
 HALF_LIVES_TIME = {
@@ -78,10 +79,17 @@ class TradeFillMA(Alpha):
         # EMA state per label (raw signed qty + price-weighted signed qty)
         self._ema: dict[str, float] = {}
         self._ema_pw: dict[str, float] = {}
+        # Gross (unsigned) EMAs at the same decay -> net/gross ratio in [-1,1],
+        # a scale-free flow imbalance (the obi analog for flow; transfers across
+        # games regardless of volume/interest)
+        self._ema_gross: dict[str, float] = {}
+        self._ema_pw_gross: dict[str, float] = {}
         all_labels = list(self._count_hls.keys()) + list(self._time_hls.keys())
         for label in all_labels:
             self._ema[label] = 0.0
             self._ema_pw[label] = 0.0
+            self._ema_gross[label] = 0.0
+            self._ema_pw_gross[label] = 0.0
 
         self._last_time: float | None = None
         self._last_trade_wall_time: float | None = None
@@ -157,6 +165,8 @@ class TradeFillMA(Alpha):
                 factor = math.exp(-decay * dt)
                 self._ema[label] *= factor
                 self._ema_pw[label] *= factor
+                self._ema_gross[label] *= factor
+                self._ema_pw_gross[label] *= factor
         self._last_time = now
 
         # Count-based decay (once per fill)
@@ -164,12 +174,16 @@ class TradeFillMA(Alpha):
             factor = math.exp(-decay)
             self._ema[label] *= factor
             self._ema_pw[label] *= factor
+            self._ema_gross[label] *= factor
+            self._ema_pw_gross[label] *= factor
 
         self._last_trade_wall_time = time.time()
 
         for label in self._ema:
             self._ema[label] += signed_qty
             self._ema_pw[label] += weighted_qty
+            self._ema_gross[label] += abs(signed_qty)
+            self._ema_pw_gross[label] += abs(weighted_qty)
 
     def values(self, now: float | None = None) -> dict[str, float | None]:
         """Current signal value per half-life label. None if no fills yet. Read-only.
@@ -219,6 +233,22 @@ class TradeFillMA(Alpha):
                 value *= factor
             result[label] = value
         return result
+
+    def values_ratio(self, now: float | None = None) -> dict[str, float | None]:
+        """Net/gross signed-qty ratio per label in [-1,1] (scale-free flow
+        imbalance). Decay cancels in the ratio, so it's staleness-invariant;
+        None if no fills or no recent flow (gross ~ 0)."""
+        if self._n_fills == 0:
+            return {label: None for label in self._ema}
+        return {label: (self._ema[label] / g if is_pos(g := self._ema_gross[label]) else None)
+                for label in self._ema}
+
+    def values_pw_ratio(self, now: float | None = None) -> dict[str, float | None]:
+        """Price-weighted net/gross ratio per label in [-1,1]."""
+        if self._n_fills == 0:
+            return {label: None for label in self._ema_pw}
+        return {label: (self._ema_pw[label] / g if is_pos(g := self._ema_pw_gross[label]) else None)
+                for label in self._ema_pw}
 
     @property
     def value(self) -> Optional[float]:

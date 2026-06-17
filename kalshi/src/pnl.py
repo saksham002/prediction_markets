@@ -8,6 +8,8 @@ strategies (single-leg, mark-to-market or resolution-based PnL).
 from dataclasses import dataclass, field
 import math
 
+from src.utils.feps import is_pos
+
 
 @dataclass
 class Position:
@@ -118,14 +120,14 @@ class PnL:
             self.realized_by_ticker[ticker] = self.realized_by_ticker.get(ticker, 0.0) + realized
 
             remaining = pos.qty - close_qty
-            if remaining > 0:
+            if is_pos(remaining):
                 pos.qty = remaining
             else:
                 del self.positions[ticker]
 
             # If incoming trade is larger, open new position on the other side
             leftover = qty - close_qty
-            if leftover > 0:
+            if is_pos(leftover):
                 self.positions[ticker] = Position(ticker = ticker, side = side, qty = leftover, avg_price = price)
 
     def resolve(self, ticker: str, outcome: float):

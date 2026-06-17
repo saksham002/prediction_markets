@@ -21,6 +21,8 @@ as in TradeFillMA.
 import math
 from collections import deque
 
+from src.utils.feps import is_pos, lte
+
 
 PENDING_WINDOW_S = 1.0
 
@@ -41,6 +43,10 @@ class AggFlowMA:
         self._decays = {label: math.log(2) / hl for label, hl in half_life_seconds.items()}
         self._ema_lvl = {label: 0.0 for label in self._decays}
         self._ema_pw = {label: 0.0 for label in self._decays}
+        # Gross (unsigned) EMAs at the same decay -> net/gross flow-imbalance
+        # ratio in [-1,1] (scale-free; the obi analog for flow)
+        self._ema_lvl_gross = {label: 0.0 for label in self._decays}
+        self._ema_pw_gross = {label: 0.0 for label in self._decays}
         self._last_time: float | None = None
         self._pending: deque = deque()  # (ts, ticker, side, price_f, qty, lvl_f, pw_f)
         self._n_events = 0
@@ -65,6 +71,8 @@ class AggFlowMA:
                     f = math.exp(-d * dt)
                     self._ema_lvl[label] *= f
                     self._ema_pw[label] *= f
+                    self._ema_lvl_gross[label] *= f
+                    self._ema_pw_gross[label] *= f
         self._last_time = ts
 
     def _add(self, ts: float, lvl_contribution: float, pw_contribution: float):
@@ -72,6 +80,8 @@ class AggFlowMA:
         for label in self._decays:
             self._ema_lvl[label] += lvl_contribution
             self._ema_pw[label] += pw_contribution
+            self._ema_lvl_gross[label] += abs(lvl_contribution)
+            self._ema_pw_gross[label] += abs(pw_contribution)
         self._n_events += 1
 
     def _level_factors(self, ticker: str, side: str, price_f: float) -> tuple[float, float]:
@@ -84,7 +94,7 @@ class AggFlowMA:
     def _flush_pending(self, now: float):
         while self._pending and now - self._pending[0][0] > PENDING_WINDOW_S:
             ts, ticker, side, price_f, qty, lvl_f, pw_f = self._pending.popleft()
-            if qty <= 0:
+            if lte(qty, 0):
                 continue
             sign = self._sign(ticker, side)
             cancel_sign = -sign  # pulled liquidity is the opposite signal
@@ -146,3 +156,16 @@ class AggFlowMA:
 
     def values_pw(self, now: float | None = None) -> dict[str, float | None]:
         return self._values(self._ema_pw, now)
+
+    def _values_ratio(self, ema, gross):
+        if self._n_events == 0:
+            return {label: None for label in ema}
+        return {label: (ema[label] / g if is_pos(g := gross[label]) else None) for label in ema}
+
+    def values_lvl_ratio(self, now: float | None = None) -> dict[str, float | None]:
+        """Net/gross level-weighted flow ratio in [-1,1] (decay cancels -> staleness-invariant)."""
+        return self._values_ratio(self._ema_lvl, self._ema_lvl_gross)
+
+    def values_pw_ratio(self, now: float | None = None) -> dict[str, float | None]:
+        """Net/gross price-weighted flow ratio in [-1,1]."""
+        return self._values_ratio(self._ema_pw, self._ema_pw_gross)

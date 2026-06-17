@@ -15,6 +15,7 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.mm_sim import MMSimConsumer
 from research.hft.replay import Replayer
+from research.hft.passive_fill import FORWARD_DELAY_S
 
 # Component buckets: substrings matched against "file:function" keys
 BUCKETS = [
@@ -41,7 +42,7 @@ def main():
         per_order_size = 500, inventory_cap = 1000, skew_threshold = 0.0,
         alpha_name = args.alpha, max_spread = 0.02, price_min = 0.05, price_max = 0.95,
         improve = False, pair_risk = True, combo = None, series = None,
-        forward_delay = 0.020, size_ref = None, max_queue_ahead = None,
+        forward_delay = FORWARD_DELAY_S, size_ref = None, max_queue_ahead = None,
         depth_quote = False, ladder = False, per_leg_alpha = False,
         budget = 1000, write_rate = 10,
     )

@@ -1,7 +1,9 @@
-"""WC FootballStrategy sweep: in-sample (first 4 WC games) vs out-sample (last 4)
-for blind quoting and per-alpha (obi / agg / tfma) skew, over order size,
-position limit (10..5000), and alpha threshold. Budget is effectively off so the
-POSITION LIMIT is the binding constraint. Reports in vs out net PnL.
+"""WC FootballStrategy sweep: train (first 8 WC games, chronological) vs test
+(next 8) for blind, raw obi, NORMALIZED flow (agg_ratio / tfma_pw_ratio =
+net/gross flow imbalance, scale-free so thresholds transfer across games), and
+obi-deviation (obi - obi_ma at 5s/60s/300s), over order size, position limit,
+and alpha threshold. $1000 deployed-capital budget (ALWAYS). Reports in (train)
+vs out (test) net PnL.
 
 Usage: wc_sweep.py --shard I --num-shards N   |   wc_sweep.py --collect
 """
@@ -14,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from eval_buffer import run_one
 
 DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
-RESULTS = Path("/data/user_data/saksham3/kalshi_hft/sims/wc_sweep")
-BUDGET = 1e9   # effectively off -> position limit is the binding constraint
+RESULTS = Path("/data/user_data/saksham3/kalshi_hft/sims/wc_sweep_88")
+BUDGET = 1000.0   # real $1000 deployed-capital cap (ALWAYS for sweeps)
 
 # Thresholds = in-sample (first-4 WC) |alpha| percentiles {50,75,90,95,99}
 # (computed by wc_thresholds.py); deduped where they collapse (e.g. obi -> 1.0).
@@ -25,10 +27,12 @@ def _thrs(a):
 
 ALPHAS = [               # (label, alpha_name, [thresholds])
     ("blind", "obi", [999.0]),                       # huge thr -> symmetric, no skew
-    ("obi", "obi", _thrs("obi")),
-    ("agg", "agg_300s", _thrs("agg_300s")),
-    ("tfma", "tfma_pw_300s", _thrs("tfma_pw_300s")),
-    ("agree_agg", "agree_agg", _thrs("agree_agg")),  # obi gated by agg sign
+    ("obi", "obi", _thrs("obi")),                     # baseline (already scale-free)
+    ("agg_ratio", "agg_ratio_300s", _thrs("agg_ratio_300s")),          # net/gross agg flow (scale-free)
+    ("tfma_ratio", "tfma_pw_ratio_300s", _thrs("tfma_pw_ratio_300s")),  # net/gross trade flow (scale-free)
+    ("obi_dev_5s", "obi_dev_5s", _thrs("obi_dev_5s")),    # obi - obi_ma deviation
+    ("obi_dev_60s", "obi_dev_60s", _thrs("obi_dev_60s")),
+    ("obi_dev_300s", "obi_dev_300s", _thrs("obi_dev_300s")),
 ]
 SIZES = [10, 50, 200]
 CAPS = [10, 50, 200, 1000, 5000]
@@ -59,7 +63,7 @@ def _agg(games, cfg):
 def run_shard(shard, n):
     RESULTS.mkdir(parents = True, exist_ok = True)
     games = wc_games()
-    inn, out = games[:4], games[4:8]
+    inn, out = games[:8], games[8:16]    # train = first 8 chronologically, test = next 8
     for idx, (label, alpha, thr, s, cap) in enumerate(COMBOS):
         if idx % n != shard:
             continue
@@ -95,7 +99,7 @@ def collect():
                   f"(realized-net IN {b['in']['realized_net']:+.1f} / OUT {b['out']['realized_net']:+.1f})")
     if rows:
         bo = max(rows, key = lambda r: r["in"]["net"])
-        Path("/data/user_data/saksham3/kalshi_hft/studies/wc_best_config.json").write_text(
+        Path("/data/user_data/saksham3/kalshi_hft/studies/wc_best_config_88.json").write_text(
             json.dumps({"alpha": bo["alpha"], "thr": bo["thr"], "size": bo["size"], "cap": bo["cap"]}))
         print(f"\nOVERALL best-in: {bo['label']} thr={bo['thr']:g} s={bo['size']} cap={bo['cap']} "
               f"-> IN net {bo['in']['net']:+.1f} / OUT net {bo['out']['net']:+.1f}")
