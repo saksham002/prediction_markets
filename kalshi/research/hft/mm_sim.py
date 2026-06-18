@@ -23,15 +23,18 @@ Outputs under /data/user_data/saksham3/kalshi_hft/sims/<tag>/:
 import argparse
 import csv
 import sys
+import time
 from collections import defaultdict, deque
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine, market_obi
+from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine
 from research.hft.passive_fill import FORWARD_DELAY_S, PassiveFillEngine, price_key
-from src.utils.feps import is_pos, is_neg, is_zero, gte, lte
+from research.hft.order_router import OrderRouter, PLACE_INFLIGHT, CANCEL_INFLIGHT
+from research.hft.exchange import SimExchange
+from src.utils.feps import is_pos, is_neg, is_zero, lte
 from research.hft.replay import Replayer
 from src.pnl import PnL
 
@@ -40,23 +43,45 @@ MARKOUT_HORIZONS_S = [5, 30, 60, 300]
 STATE_LOG_INTERVAL_S = 5.0
 
 
+# Kalshi write rate limit as a TOKEN BUDGET (verified live 2026-06-17 on ENGCRO):
+# a place (order write) costs PLACE_TOKENS, a cancel (single == batch) CANCEL_TOKENS,
+# budget WRITE_BUDGET tokens per rolling second. (NB: the real exchange throttles
+# simultaneous bursts harder than the sustained 100/s — only ~5 writes clear in a
+# tight burst — but per-event quoting never bursts, so the sustained budget is the
+# right model here.)
+PLACE_TOKENS = 10
+CANCEL_TOKENS = 2
+WRITE_BUDGET = 100
+
+
 class WriteRateLimiter:
-    """Kalshi basic tier allows 10 write ops/sec (orders + cancels). Quote
-    actions beyond the rolling-1s budget are skipped and retried on a later
-    event — the same backpressure a live trader would face."""
+    """Token-budget write limiter: WRITE_BUDGET tokens per rolling 1s; a place
+    costs place_cost, a cancel cancel_cost. Actions whose cost would exceed the
+    budget are skipped and retried on a later event — the same backpressure a
+    live trader faces."""
 
-    def __init__(self, max_per_sec: float = 10):
-        self.max = max_per_sec
-        self.stamps: deque = deque()
+    def __init__(self, budget: float = WRITE_BUDGET, place_cost: float = PLACE_TOKENS,
+                 cancel_cost: float = CANCEL_TOKENS):
+        self.budget = budget
+        self.place_cost = place_cost
+        self.cancel_cost = cancel_cost
+        self.events: deque = deque()        # (ts, cost) within the last 1s
+        self._spent = 0.0
 
-    def try_acquire(self, now: float, n: int = 1) -> bool:
-        while self.stamps and now - self.stamps[0] >= 1.0:
-            self.stamps.popleft()
-        if len(self.stamps) + n > self.max:
+    def _try(self, now: float, cost: float) -> bool:
+        while self.events and now - self.events[0][0] >= 1.0:
+            self._spent -= self.events.popleft()[1]
+        if self._spent + cost > self.budget:
             return False
-        for _ in range(n):
-            self.stamps.append(now)
+        self.events.append((now, cost))
+        self._spent += cost
         return True
+
+    def try_place(self, now: float) -> bool:
+        return self._try(now, self.place_cost)
+
+    def try_cancel(self, now: float) -> bool:
+        return self._try(now, self.cancel_cost)
 
 
 class PairMM:
@@ -66,16 +91,15 @@ class PairMM:
         self.params = params
         self.first_ticker = pair["first_ticker"]
         self.second_ticker = pair["second_ticker"]
+        # share the consumer's MarketView so obi/mid are market-only live
         self.alpha_engine = PairAlphaEngine(
-            pair, consumer.replayer.books, combo = getattr(params, "combo", None),
+            pair, consumer.view, combo = getattr(params, "combo", None),
             track_agg = "agg" in params.alpha_name,
         )
         self.inventory: dict[str, float] = {self.first_ticker: 0.0, self.second_ticker: 0.0}
-        # (ticker, side) -> list of resting order ids (>1 with --ladder)
-        self.resting: dict[tuple[str, str], list[int]] = {}
 
     def _leg_tob(self, ticker: str):
-        return self.consumer.replayer.top(ticker)
+        return self.consumer.view.top(ticker)
 
     def _pair_exposure(self) -> float:
         """Net pair-space exposure: positive = net long first team."""
@@ -206,24 +230,11 @@ class PairMM:
         if no_price > 1.0 - p.price_min + 1e-9:
             no_price = None
 
-        # Quote shaping for the exposure-ADDING side only; the reducing side
-        # always joins best for the fastest passive square-off.
-        depth_quote = getattr(p, "depth_quote", False)
-        ladder = getattr(p, "ladder", False)
-
+        # One quote per side at the joined best price (<=1 resting/side, enforced
+        # by OrderRouter). The reducing side always joins best for the fastest
+        # passive square-off.
         def shape(side: str, price: float | None, sz: float) -> list[tuple[float, float]]:
-            if price is None:
-                return []
-            adding = (side == "yes" and gte(inv, 0)) or (side == "no" and lte(inv, 0))
-            floor = p.price_min if side == "yes" else 1.0 - p.price_max
-            deeper = round(price - 0.01, 6)
-            if adding and ladder and deeper >= floor - 1e-9:
-                return [(price, sz / 2), (deeper, sz / 2)]
-            if adding and depth_quote:
-                if deeper >= floor - 1e-9:
-                    return [(deeper, sz)]
-                return []
-            return [(price, sz)]
+            return [] if price is None else [(price, sz)]
 
         if over_budget:
             # Only same-ticker netting frees cash; cap size at the open
@@ -257,7 +268,7 @@ class PairMM:
     def _leg_alpha_per_leg(self, lts: float, ticker: str, leg_sign: float) -> float:
         # Per-leg mode: the leg's OWN book imbalance (no pair averaging),
         # gated by sign agreement with the leg-signed pair momentum
-        obi_leg = market_obi(self.consumer.replayer.books[ticker])
+        obi_leg = self.consumer.view.obi(ticker)
         mom = self.alpha_engine.value_of("mom_5s", lts)
         if obi_leg is None or mom is None:
             return 0.0
@@ -265,15 +276,75 @@ class PairMM:
             return obi_leg
         return 0.0
 
-    def requote(self, lts: float):
-        fill_engine = self.consumer.fill_engine
-        max_queue = getattr(self.params, "max_queue_ahead", None)
+    def _reconcile_side(self, lts: float, ticker: str, side: str,
+                        want, alpha, expo, event):
+        """Cancel-before-replace for the single resting order on (ticker, side),
+        via OrderRouter (which enforces <=1 resting/side). `want` is (price,size)
+        or None. Market-state reads go through the consumer's MarketView so they
+        exclude our own resting orders when live."""
+        router = self.consumer.router
+        view = self.consumer.view
         limiter = self.consumer.rate_limiter
+        max_queue = getattr(self.params, "max_queue_ahead", None)
+        # In-flight lock: one outstanding action per (ticker, side). While a place/
+        # cancel is unconfirmed, do nothing this tick. (Vacuous at delay 0: place/
+        # cancel confirm inline, so the side is never in-flight here.)
+        if router.state(ticker, side) in (PLACE_INFLIGHT, CANCEL_INFLIGHT):
+            return
+        cur = router.resting_order(ticker, side)       # non-None iff RESTING
+        if want is None:
+            if cur is not None and limiter.try_cancel(lts):
+                router.cancel(lts, ticker, side)
+                self.consumer.log_order(lts, event, ticker, side, "cancel",
+                                        cur.price_f, cur.remaining, alpha,
+                                        cur.queue_ahead, expo)
+            return
+        pk = price_key(want[0])
+        if cur is not None:
+            # Passive invariant: only rest where real liquidity backs the level;
+            # a level emptied by a cancel is unsupported -> pull it
+            supported = is_pos(view.depth(ticker, side, cur.price))
+            if supported and cur.price == pk:
+                return                                 # keep queue position
+            if limiter.try_cancel(lts):
+                router.cancel(lts, ticker, side)
+                self.consumer.log_order(lts, event, ticker, side, "cancel",
+                                        cur.price_f, cur.remaining, alpha,
+                                        cur.queue_ahead, expo)
+            else:                                      # rate-limited: keep order, retry later
+                self.consumer.log_order(lts, event, ticker, side, "rate_limited",
+                                        cur.price_f, cur.remaining, alpha,
+                                        cur.queue_ahead, expo)
+                return                                 # SKIP place -> never stack
+        # place only if the side is free now (delay 0: cancel completed inline;
+        # delay>0: a just-sent cancel is still in flight -> defer to a later tick)
+        if not router.can_place(ticker, side):
+            return
+        # Passive invariant: never create a price level with no real backing
+        if lte(view.depth(ticker, side, pk), 0):
+            return
+        # Queue-depth guard: a fresh join behind a huge displayed queue only
+        # fills when the level breaks (worst selection)
+        if max_queue is not None and view.depth(ticker, side, pk) > max_queue:
+            return
+        if not limiter.try_place(lts):
+            return                                     # rate-limited: place retries later
+        router.place(lts, ticker, side, want[0], want[1])
+        o = router.resting_order(ticker, side)         # RESTING at delay 0
+        qa = o.queue_ahead if o is not None else view.depth(ticker, side, pk)
+        self.consumer.log_order(lts, event, ticker, side, "place",
+                                want[0], want[1], alpha, qa, expo)
+
+    def requote(self, lts: float):
         per_leg = getattr(self.params, "per_leg_alpha", False)
         if not per_leg:
             # Single lazy alpha computation per event, mirrored across legs
+            if self.consumer._timing:
+                self.consumer._evt["alpha_start"] = time.time()      # #3
             base = self.alpha_engine.value_of(self.params.alpha_name, lts)
             base = 0.0 if base is None else base
+            if self.consumer._timing:
+                self.consumer._evt["alpha"] = base
         event = self.pair["event_ticker"]
         expo = self._pair_exposure()
         for ticker, leg_sign in ((self.first_ticker, 1.0), (self.second_ticker, -1.0)):
@@ -281,49 +352,8 @@ class PairMM:
                          if per_leg else base * leg_sign)
             desired = self._desired_sides(ticker, leg_alpha, lts)
             for side in ("yes", "no"):
-                key = (ticker, side)
-                want_by_key = {price_key(p): s for p, s in desired.get(side, [])}
-                kept = []
-                for oid in self.resting.get(key, []):
-                    order = fill_engine.orders.get(oid)
-                    if order is None:
-                        continue
-                    # Passive invariant: only rest where real liquidity backs the
-                    # level; a level emptied by a cancel is unsupported -> pull it
-                    supported = is_pos(fill_engine.displayed(ticker, side, order.price))
-                    if supported and order.price in want_by_key:
-                        kept.append(oid)               # keep queue position
-                        del want_by_key[order.price]
-                    elif limiter.try_acquire(lts):
-                        fill_engine.cancel(oid)
-                        self.consumer.log_order(lts, event, ticker, side, "cancel",
-                                                order.price_f, order.remaining, leg_alpha,
-                                                order.queue_ahead, expo)
-                    else:
-                        kept.append(oid)               # rate-limited: cancel retries later
-                        self.consumer.log_order(lts, event, ticker, side, "rate_limited",
-                                                order.price_f, order.remaining, leg_alpha,
-                                                order.queue_ahead, expo)
-                for pk, size in want_by_key.items():
-                    # Passive invariant: never create a price level with no real
-                    # backing (displayed <= 0, e.g. an improve-inside quote)
-                    if lte(fill_engine.displayed(ticker, side, pk), 0):
-                        continue
-                    # Queue-depth guard: a fresh join behind a huge displayed
-                    # queue only fills when the level breaks (worst selection)
-                    if max_queue is not None and fill_engine.displayed(ticker, side, pk) > max_queue:
-                        continue
-                    if not limiter.try_acquire(lts):
-                        continue                        # rate-limited: place retries later
-                    oid = fill_engine.place(lts, ticker, side, float(pk), size)
-                    kept.append(oid)
-                    self.consumer.log_order(lts, event, ticker, side, "place",
-                                            float(pk), size, leg_alpha,
-                                            fill_engine.orders[oid].queue_ahead, expo)
-                if kept:
-                    self.resting[key] = kept
-                else:
-                    self.resting.pop(key, None)
+                want = (desired.get(side) or [None])[0]
+                self._reconcile_side(lts, ticker, side, want, leg_alpha, expo, event)
 
     def on_fill(self, fill):
         order = fill.order
@@ -337,14 +367,8 @@ class PairMM:
             self.inventory[ticker] -= fill.qty
             yes_space_price = round(1.0 - price, 6)
             self.consumer.pnl.trade(ticker, "short", fill.qty, yes_space_price, is_maker = True)
-        if lte(order.remaining, 0):
-            key = (ticker, order.side)
-            oids = [oid for oid in self.resting.get(key, []) if oid != order.order_id]
-            if oids:
-                self.resting[key] = oids
-            else:
-                self.resting.pop(key, None)
-
+        # Resting-order cleanup (drop/re-register the reduced order) is handled by
+        # OrderRouter.on_fill from MMSimConsumer._process_fills.
         alpha = self.alpha_engine.value_of(self.params.alpha_name, fill.lts)
         tob = self._leg_tob(ticker)
         self.consumer.log_fill(
@@ -371,12 +395,12 @@ class SingleMM:
         self.second_ticker = None
         self.consumer = consumer
         self.params = params
+        # share the consumer's MarketView so obi/mid are market-only live
         self.alpha_engine = SingleAlphaEngine(
-            ticker, consumer.replayer.books, combo = getattr(params, "combo", None),
+            ticker, consumer.view, combo = getattr(params, "combo", None),
             track_agg = "agg" in params.alpha_name,
             track_obi_ma = ("obi_ma" in params.alpha_name or "obi_dev" in params.alpha_name))
         self.inventory: dict[str, float] = {ticker: 0.0}
-        self.resting: dict[tuple[str, str], list[int]] = {}
         self._latch = 0  # aggro-entry hysteresis direction
         self._armed = False  # entry allowed only until liquidation starts
         self._peak = 0.0  # peak |inventory| since latch set
@@ -392,7 +416,7 @@ class SingleMM:
         return self._sibs
 
     def _leg_tob(self, ticker: str):
-        return self.consumer.replayer.top(ticker)
+        return self.consumer.view.top(ticker)
 
     def _pair_exposure(self) -> float:
         return self.inventory[self.ticker]
@@ -401,6 +425,7 @@ class SingleMM:
     _desired_sides = PairMM._desired_sides
     _exit_quotes = PairMM._exit_quotes
     _liquidate_quotes = PairMM._liquidate_quotes
+    _reconcile_side = PairMM._reconcile_side
     on_fill = PairMM.on_fill
 
     def _aggro_entry(self, lts: float, alpha: float):
@@ -418,7 +443,7 @@ class SingleMM:
                          and tob.yes_bid <= self._entry_px - p.aggro_stop + 1e-9)
             stop_short = (is_neg(inv) and tob.yes_ask is not None
                           and tob.yes_ask >= self._entry_px + p.aggro_stop - 1e-9)
-            if (stop_long or stop_short) and self.consumer.rate_limiter.try_acquire(lts):
+            if (stop_long or stop_short) and self.consumer.rate_limiter.try_place(lts):
                 if stop_long:
                     qty = min(inv, tob.yes_bid_qty or 0.0)
                     if qty > 0:
@@ -502,7 +527,7 @@ class SingleMM:
         if tob.spread < 0.005 or tob.yes_bid < p.price_min or tob.yes_ask > p.price_max:
             return
         budget = getattr(p, "budget", None)
-        if not self.consumer.rate_limiter.try_acquire(lts):
+        if not self.consumer.rate_limiter.try_place(lts):
             return
         if direction > 0:
             qty = min(p.aggro_limit - inv, tob.yes_ask_qty or 0.0)
@@ -531,9 +556,13 @@ class SingleMM:
                                 price, qty, alpha, None, self.inventory[self.ticker])
 
     def requote(self, lts: float):
+        if self.consumer._timing:
+            self.consumer._evt["alpha_start"] = time.time()      # #3 alpha computation start
         alpha = self.alpha_engine.value_of(self.params.alpha_name, lts)
         if alpha is None:
             alpha = 0.0
+        if self.consumer._timing:
+            self.consumer._evt["alpha"] = alpha
         if getattr(self.params, "aggro_entry", None) or getattr(self.params, "aggro_neg", None):
             self._aggro_entry(lts, alpha)
         desired = self._desired_sides(self.ticker, alpha, lts)
@@ -541,48 +570,10 @@ class SingleMM:
 
     def _apply_desired(self, lts: float, desired: dict, alpha: float):
         """Reconcile resting orders against a desired {side: [(price, size)]}."""
-        fill_engine = self.consumer.fill_engine
-        max_queue = getattr(self.params, "max_queue_ahead", None)
-        limiter = self.consumer.rate_limiter
         expo = self.inventory[self.ticker]
         for side in ("yes", "no"):
-            key = (self.ticker, side)
-            want_by_key = {price_key(p): s for p, s in desired.get(side, [])}
-            kept = []
-            for oid in self.resting.get(key, []):
-                order = fill_engine.orders.get(oid)
-                if order is None:
-                    continue
-                supported = is_pos(fill_engine.displayed(self.ticker, side, order.price))
-                if supported and order.price in want_by_key:
-                    kept.append(oid)
-                    del want_by_key[order.price]
-                elif limiter.try_acquire(lts):
-                    fill_engine.cancel(oid)
-                    self.consumer.log_order(lts, self.event_ticker, self.ticker, side, "cancel",
-                                            order.price_f, order.remaining, alpha,
-                                            order.queue_ahead, expo)
-                else:
-                    kept.append(oid)
-                    self.consumer.log_order(lts, self.event_ticker, self.ticker, side, "rate_limited",
-                                            order.price_f, order.remaining, alpha,
-                                            order.queue_ahead, expo)
-            for pk, size in want_by_key.items():
-                if lte(fill_engine.displayed(self.ticker, side, pk), 0):
-                    continue                            # don't create a non-existent level
-                if max_queue is not None and fill_engine.displayed(self.ticker, side, pk) > max_queue:
-                    continue
-                if not limiter.try_acquire(lts):
-                    continue
-                oid = fill_engine.place(lts, self.ticker, side, float(pk), size)
-                kept.append(oid)
-                self.consumer.log_order(lts, self.event_ticker, self.ticker, side, "place",
-                                        float(pk), size, alpha,
-                                        fill_engine.orders[oid].queue_ahead, expo)
-            if kept:
-                self.resting[key] = kept
-            else:
-                self.resting.pop(key, None)
+            want = (desired.get(side) or [None])[0]
+            self._reconcile_side(lts, self.ticker, side, want, alpha, expo, self.event_ticker)
 
 
 class WCStrategy(SingleMM):
@@ -615,26 +606,18 @@ class WCStrategy(SingleMM):
         return "main"
 
     def _cancel_all(self, lts: float):
-        fe = self.consumer.fill_engine
+        router = self.consumer.router
         lim = self.consumer.rate_limiter
         for side in ("yes", "no"):
-            key = (self.ticker, side)
-            kept = []
-            for oid in self.resting.get(key, []):
-                order = fe.orders.get(oid)
-                if order is None:
-                    continue
-                if lim.try_acquire(lts):
-                    fe.cancel(oid)
-                    self.consumer.log_order(lts, self.event_ticker, self.ticker, side, "cancel",
-                                            order.price_f, order.remaining, None,
-                                            order.queue_ahead, self.inventory[self.ticker])
-                else:
-                    kept.append(oid)
-            if kept:
-                self.resting[key] = kept
-            else:
-                self.resting.pop(key, None)
+            cur = router.resting_order(self.ticker, side)   # non-None iff RESTING (not in-flight)
+            if cur is None:
+                continue
+            if lim.try_cancel(lts):
+                router.cancel(lts, self.ticker, side)
+                self.consumer.log_order(lts, self.event_ticker, self.ticker, side, "cancel",
+                                        cur.price_f, cur.remaining, None,
+                                        cur.queue_ahead, self.inventory[self.ticker])
+            # rate-limited: order stays resting, retried next tick
 
     def requote(self, lts: float):
         phase = self._phase(lts)
@@ -658,11 +641,49 @@ class WCStrategy(SingleMM):
 class MMSimConsumer:
     def __init__(self, replayer: Replayer, params):
         self.replayer = replayer
+        # single market-only book view shared by alphas/strategy/router. The book
+        # contains our own orders (injected by SimExchange, like prod); reads
+        # subtract the own-ledger -> market-only.
+        self.view = replayer.view
         self.params = params
-        self.fill_engine = PassiveFillEngine(
-            replayer.books,
-            forward_delay = getattr(params, "forward_delay", FORWARD_DELAY_S),
-        )
+        # Live-only timing emitter (a live_ipc.TimingEmitter, or None in sim/sweep ->
+        # ALL instrumentation below is inert and the sim path stays bit-identical).
+        # `_evt` is the per-event timing context the driver (ProdExchange/LiveFeed)
+        # stamps with exchange_ts/read_ts before each on_book/on_trade.
+        self._timing = getattr(params, "timing_emit", None)
+        self._evt: dict = {}
+        # The exchange backend has the SAME API in sim and prod. SimExchange replays
+        # + simulates our fills (queue model) and emits our order lifecycle as the
+        # exact prod message stream; ProdExchange (params.live) drives the live WS +
+        # real REST orders and raises the SAME events. Both deliver via _deliver.
+        if getattr(params, "live", False):
+            from research.hft.exchange import ProdExchange
+            self.exchange = ProdExchange(self.view, getattr(params, "tickers", []),
+                                         on_deliver = self._deliver)
+            self.fill_engine = None                      # prod: no queue model (real private fills)
+        else:
+            # Feed delays default to 0 (equivalence test); AWS constants for realistic runs.
+            self.exchange = SimExchange(
+                self.view,
+                fwd_delay = getattr(params, "forward_delay", FORWARD_DELAY_S),
+                ack_delay = getattr(params, "ack_delay", 0.0),
+                pub_delay = getattr(params, "pub_delay", 0.0),
+                fill_delay = getattr(params, "fill_delay", 0.0),
+                fill_pub_lag = getattr(params, "fill_pub_lag", 0.0),
+                on_deliver = self._deliver,
+            )
+            self.fill_engine = self.exchange.fill_engine     # alias (queue reads)
+        # the ONLY path passive orders flow through (in-flight lock; routes PnL/
+        # inventory off the authoritative private fill via _on_fill_reduce)
+        self.router = OrderRouter(self.exchange, self.view, on_reduce = self._on_fill_reduce,
+                                  on_order = self._log_order_timing if self._timing else None)
+        self._cur_lts = 0.0          # lts of the recorded message being processed
+        self._fill_flag = False      # a fill landed this tick -> requote
+        # debug: shadow recorded-market book to assert market-only reads (book minus
+        # our injected orders) == the pure recorded market, every tick.
+        self._dbg = getattr(params, "debug_shadow", False)
+        self._shadow: dict = {}
+        self._dbg_hits = 0
         self.pnl = PnL(charge_fees = True, fee_model = "kalshi")
         self.strategies: dict[str, PairMM] = {}
         self.mm_by_ticker: dict[str, PairMM] = {}
@@ -671,19 +692,49 @@ class MMSimConsumer:
         self.fill_rows: list[dict] = []
         self.last_mid: dict[str, float] = {}
         self.peak_deployed: float = 0.0
-        self.rate_limiter = WriteRateLimiter(getattr(params, "write_rate", 10))
+        self.rate_limiter = WriteRateLimiter(getattr(params, "write_budget", WRITE_BUDGET))
         # Periodic per-strategy state snapshots for visualization/refit
         self.state_rows: list[dict] = []
         self._last_state_log: dict[str, float] = {}
-        # Order decisions happen only on trades or top-of-book moves
-        self._last_quote: dict[str, tuple] = {}
         # Generic decision log: one row per place/cancel/fill/skip with the
         # context that explains it (works for any strategy; drives viz)
         self.order_rows: list[dict] = []
 
+    # ---- debug shadow (per-tick market-only invariant) ----
+    def _shadow_snapshot(self, ticker):
+        b = self.view.books[ticker]
+        self._shadow[ticker] = {"yes": dict(b.yes.levels), "no": dict(b.no.levels)}
+
+    def _shadow_delta(self, ticker, side, price, delta):
+        # recorded market-only level (clamped at 0, like the real market book)
+        sh = self._shadow.setdefault(ticker, {"yes": {}, "no": {}})[side]
+        q = max(0.0, sh.get(price, 0.0) + delta)
+        if is_pos(q):
+            sh[price] = q
+        else:
+            sh.pop(price, None)
+
+    def _check_shadow(self, ticker, lts, ctx):
+        if self._dbg_hits >= 15:
+            return
+        for side in ("yes", "no"):
+            mk = self.view.market_levels(ticker, side)
+            sh = self._shadow.get(ticker, {}).get(side, {})
+            for p in set(mk) | set(sh):
+                mv, sv = mk.get(p, 0.0), sh.get(p, 0.0)
+                if abs(mv - sv) > 1e-6:
+                    self._dbg_hits += 1
+                    print(f"SHADOW MISMATCH [{ctx}] lts={lts:.3f} {ticker} {side} px={p}: "
+                          f"view_market={mv:.4f} recorded={sv:.4f} diff={mv - sv:.4f} "
+                          f"own={self.view.own_qty(ticker, side, p):.4f}", flush = True)
+                    if self._dbg_hits >= 15:
+                        return
+
     def log_order(self, lts: float, event: str, ticker: str, side: str, action: str,
                   price, size, alpha, queue_ahead = None, exposure = None):
-        tob = self.replayer.top(ticker)
+        if self._timing:
+            return                       # live: sent orders are logged via the router on_order hook
+        tob = self.view.top(ticker)
         self.order_rows.append({
             "lts": round(lts, 3),
             "event": event,
@@ -747,8 +798,46 @@ class MMSimConsumer:
                 self.strategies[key] = mm
                 self.mm_by_ticker[tkr] = mm
 
+    def _game_of(self, mm):
+        return mm.pair["event_ticker"] if mm.second_ticker is not None else mm.event_ticker
+
+    def _log_order_timing(self, ticker, side, action, price, qty, t_sent, t_done):
+        """OrderRouter on_order hook, called AFTER the order is placed (off the order's
+        critical path). Assembles the per-order record from the strategy-stamped event
+        context (`_evt`) + emits it to the logger. Every field is strategy-sourced; the
+        logger computes none of it."""
+        mm = self.mm_by_ticker.get(ticker)
+        e = self._evt
+        self._timing.emit({
+            "type": "order", "exchange_ts": e.get("exchange_ts"), "read_ts": e.get("read_ts"),
+            "alpha_start": e.get("alpha_start"), "strategy_start": e.get("strategy_start"),
+            "sent_to_router": t_sent, "router_done": t_done,
+            "game": self._game_of(mm) if mm else None, "leg": ticker, "side": side,
+            "action": action, "qty": qty, "price": price, "alpha": e.get("alpha"),
+        })
+
+    def _emit_decision(self, mm, lts: float):
+        """Per market event where the strategy re-decided: log the decision alpha
+        (strategy-sourced). Emitted after requote."""
+        e = self._evt
+        # obi is a COMPONENT of the obi-family decision alpha (obi_dev = obi - obi_ma),
+        # cached from the requote's value_of -> cheap, not an extra alpha. Logged so the
+        # offline check can compare the instantaneous obi EXACTLY (book-state-based,
+        # immune to the obi_ma warmup/cross-clock noise that confounds obi_dev).
+        obi = (mm.alpha_engine.value_of("obi", lts)
+               if self.params.alpha_name.startswith("obi") else None)
+        self._timing.emit({
+            "type": "decision", "exchange_ts": e.get("exchange_ts"), "read_ts": e.get("read_ts"),
+            "alpha_start": e.get("alpha_start"), "strategy_start": e.get("strategy_start"),
+            "game": self._game_of(mm),
+            "leg": mm.ticker if mm.second_ticker is None else mm.first_ticker,
+            "alpha": e.get("alpha"), "obi": obi,
+        })
+
     def _record_mid(self, lts: float, ticker: str):
-        tob = self.replayer.top(ticker)
+        if self._timing:
+            return                       # live: markouts come from the logger's feed
+        tob = self.view.top(ticker)
         mid = tob.mid
         if mid is None or self.last_mid.get(ticker) == mid:
             return
@@ -763,16 +852,68 @@ class MMSimConsumer:
             total += pos.qty * cost
         return total
 
-    def _process_fills(self, fills):
-        for fill in fills:
-            mm = self.mm_by_ticker.get(fill.order.ticker)
+    def _deliver(self, kind: str, msg: dict):
+        """Dispatch a feed message from the SimExchange (own messages + the inline
+        delay-0 confirmations of our own place/cancel). Mirrors the prod consumer:
+        own deltas update book + ledger (no alpha, no requote); our own public trade
+        is fed to the alpha which self-skips it (is_own_trade); the private fill is
+        the authoritative inventory/PnL update."""
+        if kind == "public_delta":
+            self.view.apply_delta(msg["market_ticker"], msg["side"], msg["price_dollars"],
+                                  float(msg["delta_fp"]), is_own = True)
+            self.router.on_public_own_delta(msg)
+        elif kind == "ack":
+            self.router.on_ack(msg)
+        elif kind == "reject":                  # prod: exchange rejected a place/cancel
+            self.router.on_reject(msg["client_order_id"], msg["kind"])
+        elif kind == "public_trade":
+            mm = self.mm_by_ticker.get(msg["market_ticker"])
             if mm is not None:
-                mm.on_fill(fill)
-        if fills:
-            self.peak_deployed = max(self.peak_deployed, self._deployed_dollars())
+                mm.alpha_engine.on_trade(self._cur_lts, msg)   # excluded via is_own_trade
+        elif kind == "private_fill":
+            self.router.on_private_fill(msg)
+
+    def _on_fill_reduce(self, ticker: str, side: str, qty: float, yes_price: float,
+                        action, reason):
+        """Authoritative fill (private channel) -> inventory + PnL + fill log. Replaces
+        the old synchronous PairMM.on_fill; driven by OrderRouter.on_private_fill."""
+        mm = self.mm_by_ticker.get(ticker)
+        if mm is None:
+            return
+        lts = self._cur_lts
+        if side == "yes":
+            mm.inventory[ticker] += qty
+            own_price = round(yes_price, 6)
+            self.pnl.trade(ticker, "long", qty, yes_price, is_maker = True)
+        else:
+            mm.inventory[ticker] -= qty
+            own_price = round(1.0 - yes_price, 6)
+            self.pnl.trade(ticker, "short", qty, yes_price, is_maker = True)
+        self._fill_flag = True
+        self.peak_deployed = max(self.peak_deployed, self._deployed_dollars())
+        # live: inventory+PnL above are essential; the fill itself is logged by the
+        # separate logger off the private feed -> skip the in-process fill log.
+        if self._timing:
+            return
+        alpha = mm.alpha_engine.value_of(self.params.alpha_name, lts)
+        tob = self.view.top(ticker)
+        event = mm.pair["event_ticker"] if mm.second_ticker is not None else mm.event_ticker
+        self.fill_rows.append({
+            "lts": lts, "event_ticker": event, "ticker": ticker, "side": side,
+            "price": own_price, "yes_space_price": round(yes_price, 6), "qty": qty,
+            "reason": reason, "inventory_after": mm.inventory[ticker],
+            "alpha": alpha if alpha is not None else "",
+            "mid": tob.mid if tob.mid is not None else "",
+            "spread": tob.spread if tob.spread is not None else "",
+            "realized_pnl": self.pnl.realized_pnl, "fees_paid": self.pnl.fees_paid,
+        })
+        self.log_order(lts, event, ticker, side, "fill", own_price, qty, alpha,
+                       None, mm._pair_exposure())
 
     def _maybe_log_state(self, lts: float, mm):
         """Throttled per-strategy snapshot: odds, alpha, position, PnL components."""
+        if self._timing:
+            return                       # live: state is reconstructable from the logs
         key = mm.pair["event_ticker"] if mm.second_ticker is not None else f"{mm.event_ticker}:{mm.ticker}"
         last = self._last_state_log.get(key)
         if last is not None and lts - last < STATE_LOG_INTERVAL_S:
@@ -811,42 +952,63 @@ class MMSimConsumer:
             w.writeheader()
             w.writerows(self.state_rows)
 
+    def _reinject_own(self, ticker: str):
+        """A recorded snapshot is market-only and wipes our orders from the book; add
+        our registered resting qty back so the book = market + ours (like a prod
+        aggregated/untagged snapshot) and reads subtract the ledger to market-only."""
+        for side, levels in self.view.own_levels(ticker).items():
+            for pk, qty in levels.items():
+                if is_pos(qty):
+                    self.view.apply_delta(ticker, side, pk, qty, is_own = True)
+
+    def requote_ticker(self, lts: float, ticker: str):
+        """Re-decide a single ticker after an OWN async event (private fill / own
+        delta) in prod — inventory/state changed, so re-quote from the current view
+        (mirrors the requote tail of on_book/on_trade). No-op for unknown tickers."""
+        mm = self.mm_by_ticker.get(ticker)
+        if mm is None:
+            return
+        self._cur_lts = lts
+        self._record_mid(lts, ticker)
+        mm.requote(lts)
+        self._maybe_log_state(lts, mm)
+
     def on_book(self, lts: float, ticker: str, delta_msg):
         mm = self.mm_by_ticker.get(ticker)
         if mm is None:
             return
-        if delta_msg is None:
-            fills = self.fill_engine.on_snapshot(lts, ticker)
-        else:
-            self.fill_engine.record_delta(
-                lts, ticker, delta_msg["side"], delta_msg["price_dollars"], float(delta_msg["delta_fp"])
-            )
-            # Aggregation alpha consumes every delta (no-op unless tracked)
-            mm.alpha_engine.on_delta(lts, ticker, delta_msg)
-            fills = self.fill_engine.on_book(lts, ticker)
-        # Order decisions only when the quote moved (or we got filled);
-        # deep-book deltas update the fill engine but trigger no requote --
-        # EXCEPT a reduction that empties a level where we rest, so the strategy
-        # can pull an order left at an unsupported (no-real-backing) level.
-        tob = self.replayer.top(ticker)
-        quote = (tob.yes_bid, tob.yes_ask)
-        moved = quote != self._last_quote.get(ticker)
-        self._last_quote[ticker] = quote
-        rest_emptied = False
-        if delta_msg is not None and float(delta_msg["delta_fp"]) < 0:
-            dside, dpk = delta_msg["side"], delta_msg["price_dollars"]
-            if lte(self.fill_engine.displayed(ticker, dside, dpk), 0):
-                for oid in mm.resting.get((ticker, dside), []):
-                    o = self.fill_engine.orders.get(oid)
-                    if o is not None and o.price == dpk:
-                        rest_emptied = True
-                        break
-        if not (moved or fills or rest_emptied):
-            return
+        self._cur_lts = lts
+        self._fill_flag = False
+        self.exchange.drain(lts)                  # own messages due before this event
+        if delta_msg is None:                     # snapshot (book just reloaded market-only)
+            if self._dbg:
+                self._shadow_snapshot(ticker)     # recorded market-only (pre re-injection)
+            # sim: recorded snapshots are market-only -> re-inject our resting qty.
+            # prod: the live snapshot already includes our orders -> do NOT re-inject.
+            if self.exchange.simulates:
+                self._reinject_own(ticker)
+            self.exchange.on_recorded_snapshot(lts, ticker)
+        else:                                     # market delta (book already applied by replay)
+            if self._dbg:
+                self._shadow_delta(ticker, delta_msg["side"], delta_msg["price_dollars"],
+                                   float(delta_msg["delta_fp"]))
+            mm.alpha_engine.on_delta(lts, ticker, delta_msg)   # agg flow (no-op unless tracked)
+            self.exchange.on_recorded_delta(lts, ticker, delta_msg["side"],
+                                            delta_msg["price_dollars"], float(delta_msg["delta_fp"]))
+        self.exchange.drain(lts)                  # our fill messages from matching
+        if self._dbg:
+            self._check_shadow(ticker, lts, "book")
+        # Every event updates the view, then the strategy re-decides from it — no
+        # special-case triggers. _reconcile_side reads market-only depth, so an order
+        # at a level with no remaining market backing (only our own qty) is pulled,
+        # and alpha changes from deep-book deltas are acted on immediately.
         self._record_mid(lts, ticker)
         mm.alpha_engine.on_book(lts, ticker)
-        self._process_fills(fills)
+        if self._timing:
+            self._evt["strategy_start"] = time.time()      # #4
         mm.requote(lts)
+        if self._timing:
+            self._emit_decision(mm, lts)
         self._maybe_log_state(lts, mm)
 
     def on_trade(self, lts: float, msg: dict):
@@ -854,11 +1016,20 @@ class MMSimConsumer:
         mm = self.mm_by_ticker.get(ticker)
         if mm is None:
             return
-        mm.alpha_engine.on_trade(lts, msg)
-        fills = self.fill_engine.on_trade(lts, msg)
+        self._cur_lts = lts
+        self._fill_flag = False
+        self.exchange.drain(lts)
+        mm.alpha_engine.on_trade(lts, msg)            # recorded taker flow (C) -> alpha
+        self.exchange.on_recorded_trade(lts, msg)     # fill engine matches -> schedule our fills
+        self.exchange.drain(lts)                       # deliver our fill messages
+        if self._dbg:
+            self._check_shadow(ticker, lts, "trade")
         self._record_mid(lts, ticker)
-        self._process_fills(fills)
+        if self._timing:
+            self._evt["strategy_start"] = time.time()      # #4
         mm.requote(lts)
+        if self._timing:
+            self._emit_decision(mm, lts)
         self._maybe_log_state(lts, mm)
 
     def log_fill(self, fill, event_ticker, yes_space_price, inventory_after, alpha, mid, spread):
@@ -930,10 +1101,6 @@ def main():
                         help = "Alpha magnitude at which order size reaches full S (alpha-proportional sizing)")
     parser.add_argument("--max-queue-ahead", type = float, default = None,
                         help = "Skip fresh joins behind more than this many displayed contracts")
-    parser.add_argument("--depth-quote", action = "store_true",
-                        help = "Rest adding-side quotes 1 tick below best (sweep capture)")
-    parser.add_argument("--ladder", action = "store_true",
-                        help = "Split adding-side size across best and best-1 tick")
     parser.add_argument("--per-leg-alpha", action = "store_true",
                         help = "Quote each leg from its own book OBI (mom-gated) instead of the pair average")
     parser.add_argument("--budget", type = float, default = 1000,

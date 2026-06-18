@@ -16,46 +16,28 @@ yes_ask = 1 - best_no_bid, with the NO bid qty as the ask size.
 import gzip
 import json
 import zlib
-from collections import defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.utils.orderbook import MarketBook
-
-
-@dataclass
-class TopOfBook:
-    yes_bid: float | None = None
-    yes_bid_qty: float | None = None
-    yes_ask: float | None = None
-    yes_ask_qty: float | None = None
-
-    @property
-    def mid(self) -> float | None:
-        if self.yes_bid is None or self.yes_ask is None:
-            return None
-        return (self.yes_bid + self.yes_ask) / 2
-
-    @property
-    def spread(self) -> float | None:
-        if self.yes_bid is None or self.yes_ask is None:
-            return None
-        return round(self.yes_ask - self.yes_bid, 6)
+# TopOfBook + the market-only book view live in market_view (re-exported here so
+# existing `from research.hft.replay import TopOfBook` callers keep working).
+from research.hft.market_view import MarketView, TopOfBook
 
 
 class Replayer:
     def __init__(self, path: str | Path):
         self.path = Path(path)
-        self.books: dict[str, MarketBook] = defaultdict(MarketBook)
+        # MarketView owns the books and subtracts the own-resting ledger on reads.
+        # The trading consumer injects our orders into the book (via SimExchange) and
+        # populates the ledger, so reads recover market-only; analysis consumers never
+        # register orders (empty ledger) -> reads == raw.
+        self.view = MarketView()
+        self.books: dict[str, MarketBook] = self.view.books
 
     def top(self, ticker: str) -> TopOfBook:
-        book = self.books[ticker]
-        yb, ybq = book.yes.best_bid()
-        nb, nbq = book.no.best_bid()
-        ya = None if nb is None else round(1.0 - nb, 6)
-        return TopOfBook(yes_bid = yb, yes_bid_qty = ybq, yes_ask = ya, yes_ask_qty = nbq)
+        return self.view.top(ticker)
 
     def run(self, consumer):
         on_meta = getattr(consumer, "on_meta", None)
@@ -91,6 +73,11 @@ class Replayer:
 
                 data = rec["d"]
                 msg_type = data.get("type")
+                # stamp the per-event timing context for any timing-instrumented
+                # consumer (gated -> inert/None-safe for analysis consumers)
+                if getattr(consumer, "_timing", None) is not None:
+                    consumer._evt = {"exchange_ts": data.get("msg", {}).get("ts_ms"),
+                                     "read_ts": lts}
                 if msg_type == "orderbook_snapshot":
                     msg = data["msg"]
                     ticker = msg["market_ticker"]
@@ -102,9 +89,10 @@ class Replayer:
                 elif msg_type == "orderbook_delta":
                     msg = data["msg"]
                     ticker = msg["market_ticker"]
-                    book = self.books[ticker]
-                    side = book.yes if msg["side"] == "yes" else book.no
-                    side.apply_delta(msg["price_dollars"], float(msg["delta_fp"]))
+                    # market delta -> through the view so it clamps the market portion
+                    # and never drains our own resting qty (no-op when we hold nothing)
+                    self.view.apply_delta(ticker, msg["side"], msg["price_dollars"],
+                                          float(msg["delta_fp"]), is_own = False)
                     if on_book is not None:
                         on_book(lts, ticker, msg)
                 elif msg_type == "trade":

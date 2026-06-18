@@ -1,8 +1,8 @@
 """Self-loop guard: OUR own resting orders / fills must not feed the alphas we
-trade on. obi/mom computed on the book MINUS our registered resting qty; the
+trade on. obi/mom are computed on the book MINUS our registered resting qty; the
 public print of our own fill (matched by trade_id) and our own orderbook_delta
-(tagged with client_order_id) skip the trade/flow alphas. All no-ops with
-nothing registered -> replay/sim path is unchanged."""
+(tagged with client_order_id) skip the trade/flow alphas. With an empty ledger
+(nothing registered) the subtraction is a no-op -> identical to the plain path."""
 import sys
 from pathlib import Path
 
@@ -11,7 +11,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from collections import defaultdict
 
 from src.utils.orderbook import MarketBook
+from research.hft.market_view import MarketView
 from research.hft.alphas import SingleAlphaEngine, market_obi
+
+
+def ledger_engine(books, **kw):
+    """Engine sharing a MarketView whose own-resting ledger subtracts on reads."""
+    return SingleAlphaEngine("M", MarketView(books), **kw)
 
 
 def make_books():
@@ -35,7 +41,7 @@ def test_register_resting_excludes_own_qty_from_obi():
     books = make_books()
     books["M"].yes.load_snapshot([["0.5000", "100.00"]])
     books["M"].no.load_snapshot([["0.5000", "100.00"]])
-    eng = SingleAlphaEngine("M", books)
+    eng = ledger_engine(books)
     assert abs(eng._obi()) < 1e-9                    # balanced book -> obi 0
 
     books["M"].yes.apply_delta("0.5000", 100.0)      # yes shows 200, no 100
@@ -52,7 +58,7 @@ def test_register_resting_excludes_own_from_mid():
     books = make_books()
     books["M"].yes.load_snapshot([["0.4000", "100.00"]])
     books["M"].no.load_snapshot([["0.4000", "100.00"]])
-    eng = SingleAlphaEngine("M", books)
+    eng = ledger_engine(books)
     base_mid = eng._mid()
 
     books["M"].yes.apply_delta("0.4500", 50.0)        # our improving bid moves raw mid
@@ -86,13 +92,13 @@ def test_own_delta_skipped_in_aggflow():
 
     own = {"ts_ms": 1000000, "ts": 1000, "side": "yes", "price_dollars": "0.5000",
            "delta_fp": "50.00", "client_order_id": "c1"}
-    assert eng._is_own_delta(own)
+    assert eng.view.is_own_delta(own)
     eng.on_delta(1000.0, "M", own)
     assert eng.value_of("agg_pw_30s", 1000.0) is None    # our delta ignored -> no data
 
     other = {"ts_ms": 1001000, "ts": 1001, "side": "yes", "price_dollars": "0.5000",
              "delta_fp": "50.00"}
-    assert not eng._is_own_delta(other)
+    assert not eng.view.is_own_delta(other)
     eng.on_delta(1001.0, "M", other)
     assert eng.value_of("agg_pw_30s", 1001.0) is not None  # third-party delta registers
 

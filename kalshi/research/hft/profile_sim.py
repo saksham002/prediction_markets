@@ -43,7 +43,7 @@ def main():
         alpha_name = args.alpha, max_spread = 0.02, price_min = 0.05, price_max = 0.95,
         improve = False, pair_risk = True, combo = None, series = None,
         forward_delay = FORWARD_DELAY_S, size_ref = None, max_queue_ahead = None,
-        depth_quote = False, ladder = False, per_leg_alpha = False,
+        per_leg_alpha = False,
         budget = 1000, write_rate = 10,
     )
     replayer = Replayer(args.recording)

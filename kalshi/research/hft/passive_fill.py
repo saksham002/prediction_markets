@@ -81,8 +81,12 @@ class Fill:
 
 
 class PassiveFillEngine:
-    def __init__(self, books: dict, forward_delay: float = FORWARD_DELAY_S):
+    def __init__(self, books: dict, forward_delay: float = FORWARD_DELAY_S, view = None):
         self.books = books
+        # Optional MarketView: when set, displayed depth / crossing qty read the
+        # MARKET-ONLY book (our own resting qty excluded) so our injected orders
+        # don't count as queue ahead of us. None -> raw book (legacy callers/tests).
+        self.view = view
         self.forward_delay = forward_delay
         self.orders: dict[int, RestingOrder] = {}
         self._by_ticker: dict[str, set[int]] = {}
@@ -96,6 +100,8 @@ class PassiveFillEngine:
         return book.yes if side == "yes" else book.no
 
     def displayed(self, ticker: str, side: str, price: str) -> float:
+        if self.view is not None:
+            return self.view.depth(ticker, side, price)   # market-only
         return self._book_side(ticker, side).levels.get(price, 0.0)
 
     def place(self, lts: float, ticker: str, side: str, price: float, qty: float) -> int:
@@ -133,11 +139,13 @@ class PassiveFillEngine:
         ahead of us first, so only its overflow can fill us.
         """
         opp_side = "no" if order.side == "yes" else "yes"
-        book_side = self._book_side(order.ticker, opp_side)
-        if not book_side.levels:
+        # market-only opposite-side levels (exclude our own resting qty there)
+        levels = (self.view.market_levels(order.ticker, opp_side) if self.view is not None
+                  else self._book_side(order.ticker, opp_side).levels)
+        if not levels:
             return None
         total = 0.0
-        for price_str, qty in book_side.levels.items():
+        for price_str, qty in levels.items():
             implied_ask = round(1.0 - float(price_str), 6)  # in our price space
             if implied_ask <= order.price_f + 1e-9:
                 total += qty

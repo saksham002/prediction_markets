@@ -10,7 +10,6 @@ Alphas:
   mom_{hl}      — pair mid minus EMA(pair mid) (book-pressure momentum)
 """
 
-import heapq
 import math
 import sys
 from pathlib import Path
@@ -19,105 +18,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.signals.agg_flow_ma import AggFlowMA
 from research.signals.trade_fill_ma import TradeFillMA
 from research.hft.passive_fill import price_key
-from src.utils.feps import is_pos, lte
+# Book-math helpers + the market-only view live in market_view; re-exported here
+# so callers doing `from research.hft.alphas import market_obi` keep working.
+from research.hft.market_view import MarketView, market_obi  # noqa: F401
 
 TFMA_HLS = {"1s": 1, "5s": 5, "10s": 10, "30s": 30, "60s": 60, "120s": 120,
             "300s": 300, "600s": 600, "900s": 900, "1800s": 1800}
 MOM_HLS = {"1s": 1, "5s": 5, "10s": 10, "30s": 30, "120s": 120, "300s": 300, "600s": 600}
 OBI_MA_HLS = {"1s": 1, "5s": 5, "15s": 15, "60s": 60, "300s": 300, "900s": 900}
-OBI_LEVELS = 3
-OBI_LEVEL_DECAY = 0.5
-
-
-def _depth(book_side, levels: int = OBI_LEVELS, decay: float = OBI_LEVEL_DECAY,
-           own: dict | None = None) -> float | None:
-    """Geometrically weighted depth over the top `levels` price levels. `own`
-    (price_key -> our resting qty) is subtracted per level so book-state alphas
-    exclude our own orders (live self-loop guard); None/empty = no subtraction."""
-    lv = book_side.levels
-    if not lv:
-        return None
-    if own:
-        lv = {p: q - own.get(p, 0.0) for p, q in lv.items()}
-        lv = {p: q for p, q in lv.items() if is_pos(q)}
-        if not lv:
-            return None
-    if len(lv) <= levels:
-        prices = sorted(lv.keys(), key = float, reverse = True)
-    else:
-        prices = heapq.nlargest(levels, lv.keys(), key = float)
-    total = 0.0
-    w = 1.0
-    for p in prices:
-        total += w * lv[p]
-        w *= decay
-    return total
-
-
-def market_obi(book, own_yes: dict | None = None, own_no: dict | None = None) -> float | None:
-    """(bid_depth - ask_depth) / (bid_depth + ask_depth) for one market, in YES
-    space. own_yes/own_no subtract our own resting qty from each book side."""
-    bid_depth = _depth(book.yes, own = own_yes)
-    ask_depth = _depth(book.no, own = own_no)
-    if bid_depth is None or ask_depth is None:
-        return None
-    total = bid_depth + ask_depth
-    if lte(total, 0):
-        return None
-    return (bid_depth - ask_depth) / total
-
-
-def _best_bid_ex(book_side, own: dict | None = None) -> float | None:
-    """Highest price whose displayed qty exceeds OUR own resting qty there (the
-    market-only best bid), so our own quotes don't move the mid feeding mom.
-    Falls back to the raw best price when we hold nothing on this side."""
-    if not own:
-        return book_side.best_bid()[0]
-    best = None
-    for p, q in book_side.levels.items():
-        if is_pos(q - own.get(p, 0.0)) and (best is None or float(p) > best):
-            best = float(p)
-    return best
 
 
 class _OwnOrderMixin:
-    """Live self-loop guard: keep OUR own resting orders and fills out of the
-    alphas we trade on, else we self-reinforce (our resting bid inflates bid
-    depth -> obi favors buy -> we quote more bid -> ...). Every hook is a no-op
-    until the live strategy registers state, so replay/sim (which never
-    registers) is unchanged.
-
-      register_resting(ticker, side, price, qty)  our resting qty per level;
-          obi/mom are computed on the book MINUS this (qty <= 0 clears the level)
-      mark_own_fill(trade_id)  a trade_id seen on the private fill channel; the
-          public trade print of the same fill then skips the trade/flow alphas
-    """
-
-    def _init_own(self):
-        self._own: dict[tuple[str, str], dict[str, float]] = {}
-        self._own_trade_ids: set[str] = set()
+    """Thin shim so both engines expose register_resting / mark_own_fill that
+    delegate to the shared MarketView (the single own-order ledger). Live-only;
+    no-op in replay (nothing registers). Market-only obi/mid come from the view
+    directly (view.obi / view.best_bid), and on_trade/on_delta own-skip via
+    view.is_own_trade / view.is_own_delta."""
 
     def register_resting(self, ticker: str, side: str, price: float, qty: float):
-        level = self._own.setdefault((ticker, side), {})
-        pk = price_key(price)
-        if qty <= 0:
-            level.pop(pk, None)
-        else:
-            level[pk] = qty
+        self.view.register(ticker, side, price_key(price), qty)
 
     def mark_own_fill(self, trade_id: str):
-        self._own_trade_ids.add(trade_id)
-
-    def _own_side(self, ticker: str, side: str) -> dict | None:
-        return self._own.get((ticker, side)) or None
-
-    def _is_own_delta(self, msg: dict) -> bool:
-        # On the authenticated WS, Kalshi tags ONLY our own orderbook_delta with
-        # client_order_id, so its presence identifies the delta as ours.
-        return bool(msg.get("client_order_id"))
-
-    def _is_own_trade(self, msg: dict) -> bool:
-        return msg.get("trade_id") in self._own_trade_ids
+        self.view.mark_own_fill(trade_id)
 
 
 class PairAlphaEngine(_OwnOrderMixin):
@@ -130,7 +52,10 @@ class PairAlphaEngine(_OwnOrderMixin):
         per-book-event OBI recompute is expensive and unused by strategies)
         """
         self.pair = pair
-        self.books = books
+        # accept a MarketView (preferred, shared with the consumer) or a raw books
+        # dict (wrapped; empty ledger -> reads == raw, for analysis callers)
+        self.view = books if isinstance(books, MarketView) else MarketView(books)
+        self.books = self.view.books
         self.combo = combo
         # Combos referencing smoothed OBI need the EMA maintained
         self.track_obi_ma = track_obi_ma or bool(
@@ -148,19 +73,17 @@ class PairAlphaEngine(_OwnOrderMixin):
             combo and any(k.startswith("agg") for k in combo["weights"])
         )
         self.aggflow = AggFlowMA(
-            books, pair_tickers = (self.first_ticker, self.second_ticker),
+            self.view, pair_tickers = (self.first_ticker, self.second_ticker),
             half_life_seconds = TFMA_HLS,
         ) if self.track_agg else None
-        self._init_own()
         self._mid_ema: dict[str, float | None] = {label: None for label in MOM_HLS}
         self._mid_ema_last_ts: float | None = None
         self._obi_ema: dict[str, float | None] = {label: None for label in OBI_MA_HLS}
         self._obi_ema_last_ts: float | None = None
 
     def _leg_mid(self, ticker: str) -> float | None:
-        book = self.books[ticker]
-        yb = _best_bid_ex(book.yes, self._own_side(ticker, "yes"))
-        nb = _best_bid_ex(book.no, self._own_side(ticker, "no"))
+        yb, _ = self.view.best_bid(ticker, "yes")
+        nb, _ = self.view.best_bid(ticker, "no")
         if yb is None or nb is None:
             return None
         return (yb + (1.0 - nb)) / 2
@@ -178,29 +101,31 @@ class PairAlphaEngine(_OwnOrderMixin):
         return (first_mid + (1.0 - second_mid)) / 2
 
     def on_trade(self, lts: float, msg: dict):
-        if self._is_own_trade(msg):
+        if self.view.is_own_trade(msg):
             return
         self.tfma.on_message("trade", msg)
         if self.aggflow is not None:
             self.aggflow.on_trade(msg)
 
     def on_delta(self, lts: float, ticker: str, msg: dict):
-        if self.aggflow is None or self._is_own_delta(msg):
+        if self.aggflow is None or self.view.is_own_delta(msg):
             return
         ts = float(msg["ts_ms"]) / 1000.0 if "ts_ms" in msg else lts
         self.aggflow.on_delta(ticker, msg["side"], float(msg["price_dollars"]),
                               float(msg["delta_fp"]), ts)
 
     def _pair_obi(self) -> float | None:
-        obi_first = market_obi(self.books[self.first_ticker],
-                               own_yes = self._own_side(self.first_ticker, "yes"),
-                               own_no = self._own_side(self.first_ticker, "no"))
-        obi_second = market_obi(self.books[self.second_ticker],
-                                own_yes = self._own_side(self.second_ticker, "yes"),
-                                own_no = self._own_side(self.second_ticker, "no"))
-        if obi_first is None or obi_second is None:
-            return None
-        return (obi_first - obi_second) / 2
+        # cache per book-state: obi is recomputed only when a book changed (any
+        # apply_delta/load_snapshot bumps BookSide._ver). Market-only obi is
+        # invariant to our own deltas, so an own delta just forces a recompute to
+        # the same value -> result is identical to recomputing every call.
+        bf, bs = self.view.books[self.first_ticker], self.view.books[self.second_ticker]
+        tok = (bf.yes._ver, bf.no._ver, bs.yes._ver, bs.no._ver)
+        if getattr(self, "_pobi_tok", None) != tok:
+            self._pobi_tok = tok
+            of, osd = self.view.obi(self.first_ticker), self.view.obi(self.second_ticker)
+            self._pobi_cache = None if (of is None or osd is None) else (of - osd) / 2
+        return self._pobi_cache
 
     def on_book(self, lts: float, ticker: str):
         mid = self.pair_mid()
@@ -380,7 +305,10 @@ class SingleAlphaEngine(_OwnOrderMixin):
         # market is its own "pair" with both legs the same ticker
         self.first_ticker = ticker
         self.second_ticker = ticker
-        self.books = books
+        # accept a MarketView (preferred, shared with the consumer) or a raw books
+        # dict (wrapped; empty ledger -> reads == raw, for analysis callers)
+        self.view = books if isinstance(books, MarketView) else MarketView(books)
+        self.books = self.view.books
         self.combo = combo
         self.track_obi_ma = track_obi_ma or bool(
             combo and any(k.startswith("obi_ma") for k in combo["weights"])
@@ -390,39 +318,42 @@ class SingleAlphaEngine(_OwnOrderMixin):
             combo and any(k.startswith("agg") for k in combo["weights"])
         )
         self.aggflow = AggFlowMA(
-            books, ticker, half_life_seconds = TFMA_HLS,
+            self.view, ticker, half_life_seconds = TFMA_HLS,
         ) if self.track_agg else None
-        self._init_own()
         self._mid_ema: dict[str, float | None] = {label: None for label in MOM_HLS}
         self._mid_ema_last_ts: float | None = None
         self._obi_ema: dict[str, float | None] = {label: None for label in OBI_MA_HLS}
         self._obi_ema_last_ts: float | None = None
 
     def _mid(self) -> float | None:
-        book = self.books[self.ticker]
-        yb = _best_bid_ex(book.yes, self._own_side(self.ticker, "yes"))
-        nb = _best_bid_ex(book.no, self._own_side(self.ticker, "no"))
+        yb, _ = self.view.best_bid(self.ticker, "yes")
+        nb, _ = self.view.best_bid(self.ticker, "no")
         if yb is None or nb is None:
             return None
         return (yb + (1.0 - nb)) / 2
 
     def _obi(self) -> float | None:
-        return market_obi(self.books[self.ticker],
-                          own_yes = self._own_side(self.ticker, "yes"),
-                          own_no = self._own_side(self.ticker, "no"))
+        # cache per book-state (see PairAlphaEngine._pair_obi): recompute only when
+        # a book changed; identical result to recomputing every call.
+        book = self.view.books[self.ticker]
+        tok = (book.yes._ver, book.no._ver)
+        if getattr(self, "_obi_tok", None) != tok:
+            self._obi_tok = tok
+            self._obi_cache = self.view.obi(self.ticker)
+        return self._obi_cache
 
     def pair_mid(self) -> float | None:
         return self._mid()
 
     def on_trade(self, lts: float, msg: dict):
-        if self._is_own_trade(msg):
+        if self.view.is_own_trade(msg):
             return
         self.tfma.on_message("trade", msg)
         if self.aggflow is not None:
             self.aggflow.on_trade(msg)
 
     def on_delta(self, lts: float, ticker: str, msg: dict):
-        if self.aggflow is None or self._is_own_delta(msg):
+        if self.aggflow is None or self.view.is_own_delta(msg):
             return
         ts = float(msg["ts_ms"]) / 1000.0 if "ts_ms" in msg else lts
         self.aggflow.on_delta(ticker, msg["side"], float(msg["price_dollars"]),

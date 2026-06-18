@@ -5,6 +5,7 @@ Kalshi REST + WebSocket helpers (auth, pagination, rate-limit retry).
 import base64
 import os
 import time
+import uuid
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -48,6 +49,89 @@ def ws_auth_headers():
         "KALSHI-ACCESS-SIGNATURE": signature,
         "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
     }
+
+
+# --- Order entry / portfolio (role-scoped keys) ---
+# "read" = read-only key (market data + portfolio reads); "trade" = trade key
+# (order placement ONLY). Default usage stays read-only so nothing can trade by
+# accident — order writes must explicitly pass role="trade".
+
+_PRIV_CACHE: dict[str, object] = {}
+
+
+def _priv_key(path: str):
+    if path not in _PRIV_CACHE:
+        with open(path, "rb") as f:
+            _PRIV_CACHE[path] = serialization.load_pem_private_key(f.read(), password = None)
+    return _PRIV_CACHE[path]
+
+
+def _role_key(role: str) -> tuple[str, str]:
+    if role == "trade":
+        return os.environ["KALSHI_KEY_ID_TRADE"], os.environ["KALSHI_PRIVATE_KEY_PATH_TRADE"]
+    return os.environ["KALSHI_KEY_ID"], os.environ["KALSHI_PRIVATE_KEY_PATH"]
+
+
+def rest_headers(method: str, path: str, role: str = "read") -> dict:
+    """Signed REST headers. `path` is the full request path incl. /trade-api/v2,
+    no query string (Kalshi signs ts+METHOD+path)."""
+    key_id, key_path = _role_key(role)
+    ts = str(int(time.time() * 1000))
+    return {"KALSHI-ACCESS-KEY": key_id,
+            "KALSHI-ACCESS-SIGNATURE": _sign(_priv_key(key_path), ts + method + path),
+            "KALSHI-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
+
+
+def create_order(ticker: str, side: str, action: str, count: int, price_cents: int,
+                 *, client_order_id: str | None = None, order_type: str = "limit"):
+    """Place an order via the TRADE key. `price_cents` is the limit price 1-99 in
+    YES space for side='yes' / NO space for side='no'. Returns the requests
+    Response (caller inspects .status_code: 201 ok, 429 rate-limited, 4xx reject)."""
+    path = "/trade-api/v2/portfolio/orders"
+    body = {"ticker": ticker, "client_order_id": client_order_id or str(uuid.uuid4()),
+            "side": side, "action": action, "count": int(count), "type": order_type}
+    if order_type == "limit":
+        body["yes_price" if side == "yes" else "no_price"] = int(price_cents)
+    return requests.post(BASE_URL + "/portfolio/orders", json = body,
+                         headers = rest_headers("POST", path, "trade"), timeout = 30)
+
+
+def cancel_order(order_id: str):
+    """Cancel one resting order via the TRADE key. Returns the Response
+    (200 ok, 429 rate-limited, 404 already gone)."""
+    path = "/trade-api/v2/portfolio/orders/" + order_id
+    return requests.delete(BASE_URL + "/portfolio/orders/" + order_id,
+                           headers = rest_headers("DELETE", path, "trade"), timeout = 30)
+
+
+def get_orders(status: str = "resting", ticker: str | None = None) -> list:
+    """All orders matching status (read key, paginated)."""
+    path = "/trade-api/v2/portfolio/orders"
+    out, cursor = [], None
+    while True:
+        params = {"status": status, "limit": 200}
+        if ticker:
+            params["ticker"] = ticker
+        if cursor:
+            params["cursor"] = cursor
+        r = requests.get(BASE_URL + "/portfolio/orders", params = params,
+                         headers = rest_headers("GET", path, "read"), timeout = 30)
+        r.raise_for_status()
+        d = r.json()
+        out.extend(d.get("orders", []))
+        cursor = d.get("cursor", "")
+        if not cursor or not d.get("orders"):
+            break
+    return out
+
+
+def get_positions() -> list:
+    """Current market positions (read key)."""
+    path = "/trade-api/v2/portfolio/positions"
+    r = requests.get(BASE_URL + "/portfolio/positions",
+                     headers = rest_headers("GET", path, "read"), timeout = 30)
+    r.raise_for_status()
+    return r.json().get("market_positions", [])
 
 
 # --- REST ---

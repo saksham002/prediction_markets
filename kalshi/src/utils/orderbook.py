@@ -13,6 +13,9 @@ class BookSide:
     # Cached best price (float, key) — rescan only when the best level empties
     _best_f: float | None = None
     _best_key: str | None = None
+    # Monotonic mutation counter — bumped on every apply_delta/load_snapshot so
+    # readers (e.g. the obi cache) can detect a book change cheaply.
+    _ver: int = 0
 
     def _rescan_best(self):
         if not self.levels:
@@ -24,6 +27,7 @@ class BookSide:
         self._best_f = float(best_key)
 
     def apply_delta(self, price: str, delta: float):
+        self._ver += 1
         current = self.levels.get(price, 0.0)
         new_qty = current + delta
         # Epsilon: fractional count_fp quantities leave float residue (e.g.
@@ -44,6 +48,7 @@ class BookSide:
         return self._best_f, self.levels[self._best_key]
 
     def load_snapshot(self, levels: list[list[str]]):
+        self._ver += 1
         self.levels.clear()
         for price, qty in levels:
             q = float(qty)

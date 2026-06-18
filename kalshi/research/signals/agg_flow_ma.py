@@ -28,13 +28,14 @@ PENDING_WINDOW_S = 1.0
 
 
 class AggFlowMA:
-    def __init__(self, books: dict, ticker: str | None = None, *,
+    def __init__(self, view, ticker: str | None = None, *,
                  pair_tickers: tuple[str, str] | None = None,
                  half_life_seconds: dict[str, float],
                  w_trade: float = 1 / 3, w_cancel: float = 1 / 3, w_new: float = 1 / 3):
         if (ticker is None) == (pair_tickers is None):
             raise ValueError("Provide exactly one of ticker or pair_tickers")
-        self.books = books
+        # MarketView (market-only level reads); behaviour-neutral in sim
+        self.view = view
         self.single_ticker = ticker
         self.pair_tickers = pair_tickers
         self.w_trade = w_trade
@@ -85,9 +86,10 @@ class AggFlowMA:
         self._n_events += 1
 
     def _level_factors(self, ticker: str, side: str, price_f: float) -> tuple[float, float]:
-        """(1/k rank factor, own-market YES-space price) for a level."""
-        bside = self.books[ticker].yes if side == "yes" else self.books[ticker].no
-        better = sum(1 for p, q in bside.levels.items() if q > 0 and float(p) > price_f)
+        """(1/k rank factor, own-market YES-space price) for a level. Reads
+        market-only levels (our own resting qty excluded when live)."""
+        levels = self.view.market_levels(ticker, side)
+        better = sum(1 for p, q in levels.items() if is_pos(q) and float(p) > price_f)
         yes_price = price_f if side == "yes" else 1.0 - price_f
         return 1.0 / (better + 1), yes_price
 

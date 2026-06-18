@@ -19,7 +19,6 @@ import os
 import signal
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import websockets
@@ -28,27 +27,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.mm_sim import MMSimConsumer, compute_markouts, MARKOUT_HORIZONS_S, OUTPUT_BASE
 from research.hft.passive_fill import FORWARD_DELAY_S
 from research.hft.record_ticks import discover_extra_events
-from research.hft.replay import TopOfBook
+from research.hft.market_view import MarketView, TopOfBook  # noqa: F401
 from research.signals.pairs import discover_top_pairs
 from src.utils.api import WS_URL, fetch_series_fee, ws_auth_headers
-from src.utils.orderbook import MarketBook
 
 
 class LiveFeed:
-    """Live websocket book feed exposing the Replayer interface (books, top)."""
+    """Live websocket book feed exposing the Replayer interface (view, books, top).
+
+    Paper trading: NO real orders are sent (fills are simulated by
+    PassiveFillEngine), so the public feed is market-only — the own-ledger stays
+    empty and reads return the raw book. A future REAL executor whose own orders
+    appear in the public feed routes its own deltas/trades/fills through the same
+    consumer handlers (own deltas via view.apply_delta(is_own=...)); the market-only
+    subtraction then keeps reads correct (see ProdExchange / exchange.py)."""
 
     def __init__(self, tickers: list[str]):
         self.tickers = tickers
-        self.books: dict[str, MarketBook] = defaultdict(MarketBook)
+        self.view = MarketView()
+        self.books = self.view.books
         self.consumer = None
         self.state_dir = None  # set by main; state.csv refreshed every status tick
 
     def top(self, ticker: str) -> TopOfBook:
-        book = self.books[ticker]
-        yb, ybq = book.yes.best_bid()
-        nb, nbq = book.no.best_bid()
-        ya = None if nb is None else round(1.0 - nb, 6)
-        return TopOfBook(yes_bid = yb, yes_bid_qty = ybq, yes_ask = ya, yes_ask_qty = nbq)
+        return self.view.top(ticker)
 
     async def run(self, status_interval_s: float = 300):
         last_status = time.time()
@@ -68,19 +70,22 @@ class LiveFeed:
                         data = json.loads(raw)
                         lts = time.time()
                         msg_type = data.get("type")
+                        # stamp the per-event timing context (#1/#2) for paper logging
+                        if self.consumer._timing is not None:
+                            self.consumer._evt = {"exchange_ts": data.get("msg", {}).get("ts_ms"),
+                                                  "read_ts": lts}
                         if msg_type == "orderbook_snapshot":
                             msg = data["msg"]
                             ticker = msg["market_ticker"]
-                            book = self.books[ticker]
-                            book.yes.load_snapshot(msg.get("yes_dollars_fp", []))
-                            book.no.load_snapshot(msg.get("no_dollars_fp", []))
+                            self.view.apply_snapshot(ticker, msg.get("yes_dollars_fp", []),
+                                                     msg.get("no_dollars_fp", []))
                             self.consumer.on_book(lts, ticker, None)
                         elif msg_type == "orderbook_delta":
                             msg = data["msg"]
                             ticker = msg["market_ticker"]
-                            book = self.books[ticker]
-                            side = book.yes if msg["side"] == "yes" else book.no
-                            side.apply_delta(msg["price_dollars"], float(msg["delta_fp"]))
+                            # paper: is_own always False (no real orders in the feed)
+                            self.view.apply_delta(ticker, msg["side"], msg["price_dollars"],
+                                                  float(msg["delta_fp"]))
                             self.consumer.on_book(lts, ticker, msg)
                         elif msg_type == "trade":
                             self.consumer.on_trade(lts, data["msg"])
@@ -179,6 +184,74 @@ def write_outputs(consumer, args, out_dir: Path):
     print("=" * 64)
 
 
+def resolve_universe(args):
+    """Discover + fee-annotate + liquidity/window-gate the trading universe; sets
+    args.tickers / args.game_starts. Returns (pairs, extra_events, tickers). Shared
+    by live_mm.main and run_live.py (the launcher) so discovery happens once."""
+    from research.hft.discovery import discover_league_events
+    from research.hft.game_times import game_start
+    from research.hft.record_ticks import liquidity_window_gate
+    all_series = ",".join(filter(None, [args.series, args.extra_series]))
+    pairs, extra_events = discover_league_events(all_series, args.top_n)
+    if not pairs and not extra_events:
+        return [], [], []
+    fee_cache = {}
+    for pair in pairs:
+        series = pair["first_ticker"].split("-", 1)[0]
+        if series not in fee_cache:
+            fee_cache[series] = fetch_series_fee(series)
+        pair["series"] = series
+        pair["fee_multiplier"], pair["fee_type"] = fee_cache[series]
+    for ev in extra_events:
+        if ev["series"] not in fee_cache:
+            fee_cache[ev["series"]] = fetch_series_fee(ev["series"])
+        ev["fee_multiplier"], ev["fee_type"] = fee_cache[ev["series"]]
+    now = time.time()
+    lookahead = (args.duration or 12) * 3600
+    pairs = liquidity_window_gate(pairs, lambda p: p["first_ticker"], now, args.min_volume, lookahead)
+    extra_events = liquidity_window_gate(extra_events, lambda e: e["tickers"][0], now, args.min_volume, lookahead)
+    args.game_starts = {}
+    for pair in pairs:
+        args.game_starts[pair["event_ticker"]] = game_start(pair["event_ticker"], pair["first_ticker"])
+    for ev in extra_events:
+        args.game_starts[ev["event_ticker"]] = game_start(ev["event_ticker"], ev["tickers"][0])
+    print(f"after liquidity/window gate: {len(pairs)} pairs, {len(extra_events)} events")
+    tickers = []
+    for pair in pairs:
+        tickers.extend([pair["first_ticker"], pair["second_ticker"]])
+    for ev in extra_events:
+        tickers.extend(ev["tickers"])
+    args.tickers = tickers
+    return pairs, extra_events, tickers
+
+
+async def build_and_run(args, pairs, extra_events, out_dir, write_at_end = True):
+    """Build the consumer + run the driver (paper LiveFeed / live ProdExchange).
+    The launcher passes write_at_end=False (the separate logger persists everything;
+    main does no file I/O)."""
+    feed = LiveFeed(args.tickers)
+    consumer = MMSimConsumer(feed, args)
+    feed.consumer = consumer
+    feed.state_dir = out_dir if write_at_end else None     # None -> no periodic dumps
+    consumer.on_meta(time.time(), {"pairs": pairs, "events": extra_events})
+    driver = consumer.exchange.run(consumer) if args.live else feed.run()
+    if args.live:
+        print("*** LIVE REAL-ORDER MODE — placing real orders via the trade key ***")
+    try:
+        if args.duration is not None:
+            await asyncio.wait_for(driver, timeout = args.duration * 3600)
+        else:
+            await driver
+    except asyncio.TimeoutError:
+        print(f"\n--- Duration {args.duration}h elapsed ---")
+    except KeyboardInterrupt:
+        print("\nStopping live MM...")
+    finally:
+        if write_at_end:
+            write_outputs(consumer, args, out_dir)
+    return consumer
+
+
 async def main():
     parser = argparse.ArgumentParser(description = "Live paper-trading passive MM (no real orders)")
     parser.add_argument("-n", "--top-n", type = int, default = 10)
@@ -207,9 +280,24 @@ async def main():
                         help = "Cap/reduce net pair exposure instead of per-ticker inventory")
     parser.add_argument("--combo-file", type = str, default = None,
                         help = "combo weights JSON from fit_combo.py (use with -a combo)")
+    parser.add_argument("--football", action = "store_true",
+                        help = "WC/soccer phase strategy (WCStrategy) for KXWCGAME/KXINTLFRIENDLYGAME")
+    parser.add_argument("--budget", type = float, default = None,
+                        help = "Global deployed-dollars cap (e.g. 1000); None = no cap")
+    parser.add_argument("--realistic", action = "store_true",
+                        help = "Prod-faithful execution: AWS feed delays (exchange.REALISTIC_DELAYS) "
+                               "+ binding in-flight lock (default: synchronous, delays=0)")
+    parser.add_argument("--live", action = "store_true",
+                        help = "REAL order execution via ProdExchange (REST orders + private fill "
+                               "channel). DEFAULT OFF = paper (fills simulated locally, no real orders).")
     parser.add_argument("-d", "--duration", type = float, default = None, help = "Hours to run")
     parser.add_argument("--tag", type = str, default = None)
     args = parser.parse_args()
+
+    if args.realistic:
+        from research.hft.exchange import REALISTIC_DELAYS
+        for k, v in REALISTIC_DELAYS.items():
+            setattr(args, k, v)
 
     args.combo = None
     if args.combo_file:
@@ -227,63 +315,11 @@ async def main():
     out_dir.mkdir(parents = True, exist_ok = True)
     print(f"Output dir: {out_dir}")
 
-    from research.hft.discovery import discover_league_events
-    all_series = ",".join(filter(None, [args.series, args.extra_series]))
-    pairs, extra_events = discover_league_events(all_series, args.top_n)
-    if not pairs and not extra_events:
+    pairs, extra_events, tickers = resolve_universe(args)
+    if not tickers:
         print("No matching events found.")
         return
-    # Annotate with series fee info (consumer seeds its fee cache from this)
-    fee_cache = {}
-    for pair in pairs:
-        series = pair["first_ticker"].split("-", 1)[0]
-        if series not in fee_cache:
-            fee_cache[series] = fetch_series_fee(series)
-        pair["series"] = series
-        pair["fee_multiplier"], pair["fee_type"] = fee_cache[series]
-    for ev in extra_events:
-        if ev["series"] not in fee_cache:
-            fee_cache[ev["series"]] = fetch_series_fee(ev["series"])
-        ev["fee_multiplier"], ev["fee_type"] = fee_cache[ev["series"]]
-
-    # Dataset rules: liquidity floor + T-1h trading window (lookahead = run
-    # duration so games starting mid-run are included and gated at quote time)
-    from research.hft.game_times import game_start
-    from research.hft.record_ticks import liquidity_window_gate
-    now = time.time()
-    lookahead = (args.duration or 12) * 3600
-    pairs = liquidity_window_gate(pairs, lambda p: p["first_ticker"], now, args.min_volume, lookahead)
-    extra_events = liquidity_window_gate(extra_events, lambda e: e["tickers"][0], now, args.min_volume, lookahead)
-    args.game_starts = {}
-    for pair in pairs:
-        args.game_starts[pair["event_ticker"]] = game_start(pair["event_ticker"], pair["first_ticker"])
-    for ev in extra_events:
-        args.game_starts[ev["event_ticker"]] = game_start(ev["event_ticker"], ev["tickers"][0])
-    print(f"after liquidity/window gate: {len(pairs)} pairs, {len(extra_events)} events")
-
-    tickers = []
-    for pair in pairs:
-        tickers.extend([pair["first_ticker"], pair["second_ticker"]])
-    for ev in extra_events:
-        tickers.extend(ev["tickers"])
-
-    feed = LiveFeed(tickers)
-    consumer = MMSimConsumer(feed, args)
-    feed.consumer = consumer
-    feed.state_dir = out_dir
-    consumer.on_meta(time.time(), {"pairs": pairs, "events": extra_events})
-
-    try:
-        if args.duration is not None:
-            await asyncio.wait_for(feed.run(), timeout = args.duration * 3600)
-        else:
-            await feed.run()
-    except asyncio.TimeoutError:
-        print(f"\n--- Duration {args.duration}h elapsed ---")
-    except KeyboardInterrupt:
-        print("\nStopping live MM...")
-    finally:
-        write_outputs(consumer, args, out_dir)
+    await build_and_run(args, pairs, extra_events, out_dir, write_at_end = True)
 
 
 if __name__ == "__main__":

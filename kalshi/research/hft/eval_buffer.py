@@ -45,9 +45,14 @@ PARAM_DEFAULTS = {
     "forward_delay": FORWARD_DELAY_S,
     "size_ref": None,
     "max_queue_ahead": None,
-    "depth_quote": False,
-    "ladder": False,
     "per_leg_alpha": False,
+    # SimExchange feed delays (s): 0 = equivalence test (synchronous, lock non-binding);
+    # AWS-realistic values for prod-faithful runs (ack=place RTT, pub=ack+PRIV->PUB
+    # lag, fill_delay=WS one-way). See REALISTIC_DELAYS in exchange usage.
+    "ack_delay": 0.0,
+    "pub_delay": 0.0,
+    "fill_delay": 0.0,
+    "fill_pub_lag": 0.0,
     "budget": 1000,
     "aggro_entry": None,
     "aggro_limit": 300,
