@@ -177,7 +177,8 @@ class OrderRouter:
         qty = float(msg["count_fp"])
         yes_price = float(msg["yes_price_dollars"])
         if self._on_reduce is not None:
-            self._on_reduce(ticker, side, qty, yes_price, msg.get("action"), msg.get("reason", "trade"))
+            self._on_reduce(ticker, side, qty, yes_price, msg.get("action"),
+                            msg.get("reason", "trade"), msg.get("post_position_fp"))
         # state: free the side once the order is fully filled. Detect via cumulative
         # fills vs the order's qty (backend-agnostic — sim drops the fe order at the
         # same point, prod has no fill engine). A fill arriving while CANCEL_INFLIGHT

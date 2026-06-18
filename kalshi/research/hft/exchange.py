@@ -193,6 +193,9 @@ class SimExchange:
         self._coid_by_feoid: dict[int, str] = {}
         self._feoid_by_coid: dict[str, int] = {}
         self._oid_str: dict[str, str] = {}
+        # net signed yes-position per ticker, to stamp post_position_fp on sim fills
+        # (mirrors what the real fill message carries; authoritative in _on_fill_reduce)
+        self._sim_pos: dict[str, float] = {}
 
     @property
     def orders(self):
@@ -270,13 +273,17 @@ class SimExchange:
             # arrive ~together (fill_pub_lag ~ 0).
             priv_ts = fill.lts + self.fill_delay
             pub_ts = priv_ts + self.fill_pub_lag
+            # post-fill net position (signed yes): + for a yes/buy fill, − for a no/sell fill
+            sign = 1.0 if side == "yes" else -1.0
+            self._sim_pos[ticker] = self._sim_pos.get(ticker, 0.0) + sign * fill.qty
+            post = self._sim_pos[ticker]
             self._schedule(pub_ts, "public_delta",
                            own_delta_msg(ticker, side, order.price_f, -fill.qty, coid, ts_ms))
             self._schedule(pub_ts, "public_trade",
                            public_trade_msg(ticker, taker_side, yes_price, fill.qty, trade_id, ts_ms))
             self._schedule(priv_ts, "private_fill",
                            private_fill_msg(ticker, side, yes_price, fill.qty, coid, oid,
-                                            trade_id, action, 0.0, ts_ms, reason = fill.reason))
+                                            trade_id, action, post, ts_ms, reason = fill.reason))
 
     def on_recorded_snapshot(self, lts, ticker):
         # the recorded (market-only) snapshot is already loaded into the book by the
@@ -465,8 +472,8 @@ class ProdExchange:
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {
                         "channels": ["orderbook_delta", "trade"], "market_tickers": self.tickers}}))
                     await ws.send(json.dumps({"id": 2, "cmd": "subscribe", "params": {
-                        "channels": ["fill", "market_positions"]}}))
-                    print(f"ProdExchange subscribed: {len(self.tickers)} tickers + fill + market_positions")
+                        "channels": ["fill"]}}))
+                    print(f"ProdExchange subscribed: {len(self.tickers)} tickers + private fill")
                     async for raw in ws:
                         self._dispatch(consumer, json.loads(raw), time.time())
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
@@ -573,7 +580,5 @@ class ProdExchange:
                     self._orders.pop(handle, None)
                     self._coid_to_handle.pop(o.coid, None)
             consumer._deliver("private_fill", msg)          # inventory/PnL only; no requote
-        elif mtype in ("market_positions", "market_position"):
-            consumer.on_positions(msg)                      # authoritative -> overwrite positions; no requote
         elif mtype == "error":
             print(f"  WS error: {data}")
