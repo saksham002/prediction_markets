@@ -456,6 +456,7 @@ class ProdExchange:
         import time
         import websockets
         from src.utils.api import WS_URL, ws_auth_headers
+        asyncio.create_task(self._watchdog(consumer))   # independent reconciliation loop
         while True:
             try:
                 async with websockets.connect(WS_URL, additional_headers = ws_auth_headers()) as ws:
@@ -464,18 +465,77 @@ class ProdExchange:
                     await ws.send(json.dumps({"id": 1, "cmd": "subscribe", "params": {
                         "channels": ["orderbook_delta", "trade"], "market_tickers": self.tickers}}))
                     await ws.send(json.dumps({"id": 2, "cmd": "subscribe", "params": {
-                        "channels": ["fill"]}}))
-                    print(f"ProdExchange subscribed: {len(self.tickers)} tickers + private fill")
+                        "channels": ["fill", "market_positions"]}}))
+                    print(f"ProdExchange subscribed: {len(self.tickers)} tickers + fill + market_positions")
                     async for raw in ws:
                         self._dispatch(consumer, json.loads(raw), time.time())
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
                 print(f"ProdExchange reconnect ({type(e).__name__}: {e}) in 5s...")
                 await asyncio.sleep(5)
 
+    # ---- watchdog: time-based reconciliation vs exchange truth (B6/B9) ----
+    async def _watchdog(self, consumer, period=10.0, stuck_after=20.0):
+        """The in-flight lock release is event-driven; if the confirming event is
+        lost (dropped WS frame w/o disconnect, or a REST response lost after the
+        exchange acted) only a TIMER can recover. Every `period`s this: (1) frees a
+        side stuck in *_INFLIGHT > `stuck_after`s by checking REST order-status,
+        (2) cancels orphan resting orders not in our book, (3) logs position drift
+        vs the REST portfolio. Runs in ProdExchange (it owns the REST connection)."""
+        import asyncio
+        import time
+        seen = {}
+        while True:
+            await asyncio.sleep(period)
+            try:
+                now = time.time()
+                router = consumer.router
+                inflight = set(router.inflight_sides())
+                for k in [k for k in seen if k not in inflight]:
+                    seen.pop(k, None)                       # resolved normally
+                for k in inflight:
+                    seen.setdefault(k, now)
+                # (1) stuck in-flight -> reconcile against exchange order-status
+                for key, t0 in list(seen.items()):
+                    if now - t0 < stuck_after:
+                        continue
+                    ticker, side = key
+                    coid = router.coid_for(ticker, side)
+                    handle = self._coid_to_handle.get(coid)
+                    resting = {o["order_id"] for o in
+                               await asyncio.to_thread(self.api.get_orders, "resting", ticker)}
+                    exists = bool(handle and handle in resting)
+                    print(f"WATCHDOG: {key} stuck in-flight {now - t0:.0f}s -> "
+                          f"exchange resting={exists}; reconciling")
+                    router.reconcile_side(ticker, side, exists)
+                    if not exists and handle:
+                        self._orders.pop(handle, None)
+                        self._coid_to_handle.pop(coid, None)
+                    seen.pop(key, None)
+                # (2) orphan resting orders (on exchange, not tracked) -> cancel
+                live = await asyncio.to_thread(self.api.get_orders, "resting", None)
+                for o in live:
+                    if o["order_id"] not in self._orders:
+                        print(f"WATCHDOG: orphan order {o['order_id'][:8]} on {o.get('ticker')} -> cancelling")
+                        await asyncio.to_thread(self.api.cancel_order, o["order_id"])
+                # (3) position drift vs REST portfolio (log loudly)
+                rest = await asyncio.to_thread(self.api.get_positions)
+                rq = {p["ticker"]: float(p.get("position", p.get("position_fp", 0))) for p in rest}
+                for ticker, mm in consumer.mm_by_ticker.items():
+                    ours = float(mm.inventory.get(ticker, 0.0))
+                    theirs = rq.get(ticker, 0.0)
+                    if abs(ours - theirs) > 1e-6:
+                        print(f"WATCHDOG: POSITION DRIFT {ticker}: tracked={ours:+.2f} exchange={theirs:+.2f}")
+            except Exception as e:
+                print(f"watchdog error: {type(e).__name__}: {e}")
+
     def _dispatch(self, consumer, data, lts):
         """Route one WS message. MARKET messages -> consumer.on_book/on_trade (same
         as the replay driver); OUR messages (own delta tagged with client_order_id,
-        private fill) -> consumer._deliver (same kinds as SimExchange)."""
+        private fill) -> consumer._deliver (same kinds as SimExchange).
+
+        The strategy RE-DECIDES (requotes) ONLY on market book-changes + trades, exactly
+        like sim: own deltas/fills only update state (ledger / inventory / PnL); the next
+        market book-change or trade picks up their effect. No separate own-event requote."""
         self._cur_lts = lts
         mtype = data.get("type")
         msg = data.get("msg", {})
@@ -490,8 +550,7 @@ class ProdExchange:
         elif mtype == "orderbook_delta":
             ticker = msg["market_ticker"]
             if msg.get("client_order_id"):                  # OUR order's book change
-                consumer._deliver("public_delta", msg)
-                consumer.requote_ticker(lts, ticker)
+                consumer._deliver("public_delta", msg)      # ledger only; no requote
             else:                                           # market depth change
                 self.view.apply_delta(ticker, msg["side"], msg["price_dollars"],
                                       float(msg["delta_fp"]), is_own = False)
@@ -513,7 +572,8 @@ class ProdExchange:
                 if not is_pos(o.remaining):
                     self._orders.pop(handle, None)
                     self._coid_to_handle.pop(o.coid, None)
-            consumer._deliver("private_fill", msg)
-            consumer.requote_ticker(lts, msg["market_ticker"])
+            consumer._deliver("private_fill", msg)          # inventory/PnL only; no requote
+        elif mtype in ("market_positions", "market_position"):
+            consumer.on_positions(msg)                      # authoritative -> overwrite positions; no requote
         elif mtype == "error":
             print(f"  WS error: {data}")

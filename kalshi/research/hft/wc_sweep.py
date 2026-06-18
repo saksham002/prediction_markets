@@ -25,33 +25,31 @@ from exchange import REALISTIC_DELAYS
 DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
 SIMS = Path("/data/user_data/saksham3/kalshi_hft/sims")
 STUDIES = Path("/data/user_data/saksham3/kalshi_hft/studies")
-N_TRAIN = 12      # 12 in-sample / 8 out-sample (20-game dataset)
+N_TRAIN = 20      # 20 in-sample / 4 out-sample (24-game dataset, chronological)
 FORWARD_DELAY = 0.020   # 20ms forward latency to gate fills
-RESULTS_SUFFIX = "_obi_tok"   # obi-only alphas + token rate limiter (fresh dir)
-# budget is per-run (--budget); results -> sims/wc_sweep_r<budget>/
-
-# Thresholds = in-sample (first-4 WC) |alpha| percentiles {50,75,90,95,99}
-# (computed by wc_thresholds.py); deduped where they collapse (e.g. obi -> 1.0).
-_PCT = json.load(open(Path("/data/user_data/saksham3/kalshi_hft/studies/wc_thresholds.json")))
-def _thrs(a):
-    return sorted(set(_PCT[a].values()))
-
-# obi + obi-variations ONLY (flow alphas agg_ratio/tfma_ratio dropped — no usable
-# realized edge, and to save sweep time). Token rate limiter (place 10 / cancel 2
-# / 100-per-sec) is picked up automatically via mm_sim.WriteRateLimiter.
-ALPHAS = [               # (label, alpha_name, [thresholds])
-    ("blind", "obi", [999.0]),                       # huge thr -> symmetric, no skew
-    ("obi", "obi", _thrs("obi")),                     # baseline (already scale-free)
-    ("obi_dev_5s", "obi_dev_5s", _thrs("obi_dev_5s")),    # obi - obi_ma deviation
-    ("obi_dev_60s", "obi_dev_60s", _thrs("obi_dev_60s")),
-    ("obi_dev_300s", "obi_dev_300s", _thrs("obi_dev_300s")),
-]
+RESULTS_SUFFIX = "_r204"   # restricted obi_dev sweep, 20-4 split (fresh dir)
+PCTS = [75, 90, 95]        # skew-threshold percentiles (of |alpha|, on the in-sample)
+SWEEP_ALPHAS = ["obi_dev_60s", "obi_dev_300s"]
 SIZES = [10, 50, 200]
-CAPS = [10, 50, 200, 1000, 5000]
+CAPS = [50, 200, 1000]
+# budget is per-run (--budget); results -> sims/wc_sweep_r<budget>_r204/
 
-COMBOS = [(label, alpha, thr, s, cap)
-          for label, alpha, thrs in ALPHAS for thr in thrs
-          for s in SIZES for cap in CAPS if s <= cap]
+
+def _build_combos():
+    """(label, alpha, thr, size, cap) grid. Thresholds = {PCTS} percentiles of
+    |alpha| computed on the SAME in-sample as the sweep (wc_games()[:N_TRAIN]) via
+    the game-set-keyed cache (threshold_cache.get_thresholds) — never a hardcoded
+    game list, never recomputed when the in-sample is unchanged."""
+    from threshold_cache import get_thresholds
+    pct = get_thresholds(wc_games()[:N_TRAIN], SWEEP_ALPHAS, PCTS)
+    out = []
+    for a in SWEEP_ALPHAS:
+        for thr in sorted({pct[a][str(p)] for p in PCTS}):
+            for s in SIZES:
+                for cap in CAPS:
+                    if s <= cap:
+                        out.append((a, a, thr, s, cap))
+    return out
 
 
 def wc_games():
@@ -75,8 +73,8 @@ def _agg(games, cfg):
 def run_shard(shard, n, budget, results):
     results.mkdir(parents = True, exist_ok = True)
     games = wc_games()
-    inn, out = games[:N_TRAIN], games[N_TRAIN:]    # 12 train / 8 test (chronological)
-    for idx, (label, alpha, thr, s, cap) in enumerate(COMBOS):
+    inn, out = games[:N_TRAIN], games[N_TRAIN:]    # 20 train / 4 test (chronological)
+    for idx, (label, alpha, thr, s, cap) in enumerate(_build_combos()):
         if idx % n != shard:
             continue
         f = results / f"wc_{label}_t{thr:g}_s{s}_c{cap}.json"
@@ -95,27 +93,30 @@ def run_shard(shard, n, budget, results):
 
 def collect(results, budget):
     rows = [json.load(open(p)) for p in sorted(results.glob("wc_*.json"))]
-    print(f"{len(rows)}/{len(COMBOS)} combos done\n")
-    print(f"{'label':>6} {'thr':>8} {'size':>5} {'cap':>5} {'IN_net':>9} {'OUT_net':>9} "
+    print(f"{len(rows)}/{len(_build_combos())} combos done\n")
+    print(f"{'label':>12} {'thr':>8} {'size':>5} {'cap':>5} {'IN_net':>9} {'OUT_net':>9} "
           f"{'IN_rn':>9} {'OUT_rn':>9} {'in_fills':>8}")
-    for r in sorted(rows, key = lambda r: -r["in"]["net"]):
-        print(f"{r['label']:>6} {r['thr']:>8g} {r['size']:>5g} {r['cap']:>5g} "
+    for r in sorted(rows, key = lambda r: -r["out"]["net"]):       # rank by OOS net
+        print(f"{r['label']:>12} {r['thr']:>8g} {r['size']:>5g} {r['cap']:>5g} "
               f"{r['in']['net']:>+9.1f} {r['out']['net']:>+9.1f} "
               f"{r['in']['realized_net']:>+9.1f} {r['out']['realized_net']:>+9.1f} {r['in']['fills']:>8}")
-    print("\n=== per-strategy: best IN-sample config -> its OUT-sample ===")
-    for label, _, _ in ALPHAS:
-        sub = [r for r in rows if r["label"] == label]
+    print("\n=== per-alpha: best OUT-sample config ===")
+    for a in SWEEP_ALPHAS:
+        sub = [r for r in rows if r["label"] == a]
         if sub:
-            b = max(sub, key = lambda r: r["in"]["net"])
-            print(f"{label:>9}: best-in thr={b['thr']:g} s={b['size']} cap={b['cap']} -> "
-                  f"IN net {b['in']['net']:+.1f} / OUT net {b['out']['net']:+.1f}  "
-                  f"(realized-net IN {b['in']['realized_net']:+.1f} / OUT {b['out']['realized_net']:+.1f})")
+            b = max(sub, key = lambda r: r["out"]["net"])
+            print(f"{a:>12}: best-out thr={b['thr']:g} s={b['size']} cap={b['cap']} -> "
+                  f"OUT net {b['out']['net']:+.1f} (OUT rn {b['out']['realized_net']:+.1f}, IN net {b['in']['net']:+.1f})")
     if rows:
-        bo = max(rows, key = lambda r: r["in"]["net"])
-        (STUDIES / f"wc_best_config_r{int(budget)}.json").write_text(
+        bo = max(rows, key = lambda r: r["out"]["net"])            # DEPLOY = best OOS net
+        brn = max(rows, key = lambda r: r["out"]["realized_net"])
+        (STUDIES / f"wc_best_config_r{int(budget)}{RESULTS_SUFFIX}.json").write_text(
             json.dumps({"alpha": bo["alpha"], "thr": bo["thr"], "size": bo["size"], "cap": bo["cap"]}))
-        print(f"\nOVERALL best-in: {bo['label']} thr={bo['thr']:g} s={bo['size']} cap={bo['cap']} "
-              f"-> IN net {bo['in']['net']:+.1f} / OUT net {bo['out']['net']:+.1f}")
+        print(f"\nBEST OOS net (-> deploy file): {bo['label']} thr={bo['thr']:g} s={bo['size']} "
+              f"cap={bo['cap']} -> OUT net {bo['out']['net']:+.1f} / OUT rn {bo['out']['realized_net']:+.1f} "
+              f"(IN net {bo['in']['net']:+.1f})")
+        print(f"BEST OOS realized-net: {brn['label']} thr={brn['thr']:g} s={brn['size']} "
+              f"cap={brn['cap']} -> OUT rn {brn['out']['realized_net']:+.1f} / OUT net {brn['out']['net']:+.1f}")
 
 
 def main():
@@ -124,9 +125,13 @@ def main():
     ap.add_argument("--num-shards", type = int, default = 1)
     ap.add_argument("--budget", type = float, default = 1000.0)
     ap.add_argument("--collect", action = "store_true")
+    ap.add_argument("--prep", action = "store_true",
+                    help = "compute + cache the in-sample thresholds (warm before sharding)")
     a = ap.parse_args()
     results = SIMS / f"wc_sweep_r{int(a.budget)}{RESULTS_SUFFIX}"
-    if a.collect:
+    if a.prep:
+        _build_combos()                          # triggers get_thresholds (compute + cache)
+    elif a.collect:
         collect(results, a.budget)
     else:
         run_shard(a.shard, a.num_shards, a.budget, results)

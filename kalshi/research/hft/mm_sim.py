@@ -36,7 +36,7 @@ from research.hft.order_router import OrderRouter, PLACE_INFLIGHT, CANCEL_INFLIG
 from research.hft.exchange import SimExchange
 from src.utils.feps import is_pos, is_neg, is_zero, lte
 from research.hft.replay import Replayer
-from src.pnl import PnL
+from src.pnl import PnL, Position
 
 OUTPUT_BASE = Path("/data/user_data/saksham3/kalshi_hft/sims")
 MARKOUT_HORIZONS_S = [5, 30, 60, 300]
@@ -910,6 +910,37 @@ class MMSimConsumer:
         self.log_order(lts, event, ticker, side, "fill", own_price, qty, alpha,
                        None, mm._pair_exposure())
 
+    def on_positions(self, msg: dict):
+        """Overwrite tracked positions with the authoritative `market_positions` data
+        (Kalshi WS, event-driven on change). Updates the strategy inventory (used for
+        quoting) AND the PnL ledger to the exchange truth. Prod-only (sim has no such
+        channel); NO requote — the next market book-change/trade re-decides with the
+        corrected position. `position_fp` is the signed net (+ long yes / - short yes)."""
+        items = msg.get("market_positions") if isinstance(msg.get("market_positions"), list) else [msg]
+        for it in items:
+            ticker = it.get("market_ticker") or it.get("ticker")
+            raw = it.get("position_fp", it.get("position"))
+            if ticker is None or raw is None:
+                continue
+            net = float(raw)
+            mm = self.mm_by_ticker.get(ticker)
+            if mm is not None:
+                mm.inventory[ticker] = net                      # authoritative overwrite (quoting)
+            if abs(net) < 1e-9:
+                self.pnl.positions.pop(ticker, None)
+                continue
+            cur = self.pnl.positions.get(ticker)
+            avg = cur.avg_price if cur is not None else 0.0     # preserve avg unless exposure given
+            exp = it.get("market_exposure_dollars")
+            if exp is not None:                                 # per-contract cost basis (yes-space)
+                e = abs(float(exp)) / abs(net)
+                avg = e if net > 0 else round(1.0 - e, 6)       # short yes -> 1 - no-cost (best-effort)
+            self.pnl.positions[ticker] = Position(ticker = ticker, side = "long" if net > 0 else "short",
+                                                  qty = abs(net), avg_price = avg)
+        if not getattr(self, "_positions_logged", False):       # log the raw shape once (verify live)
+            self._positions_logged = True
+            print(f"market_positions sample: {str(msg)[:300]}")
+
     def _maybe_log_state(self, lts: float, mm):
         """Throttled per-strategy snapshot: odds, alpha, position, PnL components."""
         if self._timing:
@@ -960,18 +991,6 @@ class MMSimConsumer:
             for pk, qty in levels.items():
                 if is_pos(qty):
                     self.view.apply_delta(ticker, side, pk, qty, is_own = True)
-
-    def requote_ticker(self, lts: float, ticker: str):
-        """Re-decide a single ticker after an OWN async event (private fill / own
-        delta) in prod — inventory/state changed, so re-quote from the current view
-        (mirrors the requote tail of on_book/on_trade). No-op for unknown tickers."""
-        mm = self.mm_by_ticker.get(ticker)
-        if mm is None:
-            return
-        self._cur_lts = lts
-        self._record_mid(lts, ticker)
-        mm.requote(lts)
-        self._maybe_log_state(lts, mm)
 
     def on_book(self, lts: float, ticker: str, delta_msg):
         mm = self.mm_by_ticker.get(ticker)

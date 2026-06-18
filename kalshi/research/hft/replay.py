@@ -81,9 +81,9 @@ class Replayer:
                 if msg_type == "orderbook_snapshot":
                     msg = data["msg"]
                     ticker = msg["market_ticker"]
-                    book = self.books[ticker]
-                    book.yes.load_snapshot(msg.get("yes_dollars_fp", []))
-                    book.no.load_snapshot(msg.get("no_dollars_fp", []))
+                    # through the view (same book-maintenance path as ProdExchange/LiveFeed)
+                    self.view.apply_snapshot(ticker, msg.get("yes_dollars_fp", []),
+                                             msg.get("no_dollars_fp", []))
                     if on_book is not None:
                         on_book(lts, ticker, None)
                 elif msg_type == "orderbook_delta":

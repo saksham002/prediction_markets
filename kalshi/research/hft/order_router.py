@@ -116,6 +116,25 @@ class OrderRouter:
             self._coid.pop(key, None)
             self._orders.pop(coid, None)
 
+    # ---- prod watchdog hooks (unused in sim) ----
+    def inflight_sides(self):
+        """(ticker, side) pairs currently stuck-able in a *_INFLIGHT state."""
+        return [k for k, s in self._state.items() if s in (PLACE_INFLIGHT, CANCEL_INFLIGHT)]
+
+    def coid_for(self, ticker: str, side: str):
+        return self._coid.get((ticker, side))
+
+    def reconcile_side(self, ticker: str, side: str, resting: bool):
+        """Watchdog reconciliation against exchange truth: resting=True -> the order
+        is live on the exchange (force RESTING); False -> it's gone (free -> IDLE)."""
+        key = (ticker, side)
+        if resting:
+            self._state[key] = RESTING
+        else:
+            self._state[key] = IDLE
+            coid = self._coid.pop(key, None)
+            self._orders.pop(coid, None)
+
     def on_reject(self, coid: str, kind: str):
         """Exchange rejected a place/cancel (hard 4xx, NOT a retryable 429) — free
         the side so the strategy re-decides instead of dead-locking in *_INFLIGHT.
