@@ -385,7 +385,7 @@ class ProdExchange:
             self._pending.append(("reject", {"client_order_id": coid, "kind": "place", "err": str(e)}))
             return None, coid
         if resp.status_code in (200, 201):
-            order_id = resp.json()["order"]["order_id"]
+            order_id = resp.json()["order_id"]            # V2 response is flat (no "order" wrapper)
             self._orders[order_id] = _ProdRestingOrder(ticker, side, price, float(qty), coid)
             self._coid_to_handle[coid] = order_id
             self._pending.append(("ack", ack_msg(ticker, side, coid, order_id, "place",

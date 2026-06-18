@@ -83,24 +83,43 @@ def rest_headers(method: str, path: str, role: str = "read") -> dict:
 
 
 def create_order(ticker: str, side: str, action: str, count: int, price_cents: int,
-                 *, client_order_id: str | None = None, order_type: str = "limit"):
-    """Place an order via the TRADE key. `price_cents` is the limit price 1-99 in
-    YES space for side='yes' / NO space for side='no'. Returns the requests
-    Response (caller inspects .status_code: 201 ok, 429 rate-limited, 4xx reject)."""
-    path = "/trade-api/v2/portfolio/orders"
-    body = {"ticker": ticker, "client_order_id": client_order_id or str(uuid.uuid4()),
-            "side": side, "action": action, "count": int(count), "type": order_type}
-    if order_type == "limit":
-        body["yes_price" if side == "yes" else "no_price"] = int(price_cents)
-    return requests.post(BASE_URL + "/portfolio/orders", json = body,
+                 *, client_order_id: str | None = None,
+                 time_in_force: str = "good_till_canceled",
+                 self_trade_prevention_type: str = "taker_at_cross",
+                 post_only: bool = False):
+    """Place an order via the TRADE key using the V2 event-order endpoint
+    (POST /portfolio/events/orders). The legacy /portfolio/orders mutation was
+    removed Jun 2026 (returns 410 deprecated_v1_order_endpoint). The original
+    (side, action, price_cents) interface is KEPT and translated to V2's YES-leg
+    bid/ask: side='yes'/'no' + action='buy'/'sell'; price_cents is the limit in
+    the SIDE's space (yes-cents for yes, no-cents for no). Returns the requests
+    Response (.status_code 200/201 ok, 429 rate-limited, 4xx reject); .json() is
+    FLAT (order_id, client_order_id, fill_count, remaining_count, ts_ms ...)."""
+    # V2 expresses everything on the YES leg: bid=buy yes, ask=sell yes.
+    # buy no == sell yes @ (1 - no_price); sell no == buy yes @ (1 - no_price).
+    if side == "yes":
+        v2_side = "bid" if action == "buy" else "ask"
+        yes_price = price_cents / 100.0
+    else:
+        v2_side = "ask" if action == "buy" else "bid"
+        yes_price = (100 - price_cents) / 100.0
+    path = "/trade-api/v2/portfolio/events/orders"
+    body = {"ticker": ticker, "side": v2_side, "count": f"{float(count):.2f}",
+            "price": f"{yes_price:.4f}", "time_in_force": time_in_force,
+            "self_trade_prevention_type": self_trade_prevention_type,
+            "client_order_id": client_order_id or str(uuid.uuid4())}
+    if post_only:
+        body["post_only"] = True
+    return requests.post(BASE_URL + "/portfolio/events/orders", json = body,
                          headers = rest_headers("POST", path, "trade"), timeout = 30)
 
 
 def cancel_order(order_id: str):
-    """Cancel one resting order via the TRADE key. Returns the Response
-    (200 ok, 429 rate-limited, 404 already gone)."""
-    path = "/trade-api/v2/portfolio/orders/" + order_id
-    return requests.delete(BASE_URL + "/portfolio/orders/" + order_id,
+    """Cancel one resting order via the TRADE key (V2 event-order endpoint).
+    Returns the Response (200 ok with {order_id, reduced_by, ts_ms}, 429
+    rate-limited, 404 already gone)."""
+    path = "/trade-api/v2/portfolio/events/orders/" + order_id
+    return requests.delete(BASE_URL + "/portfolio/events/orders/" + order_id,
                            headers = rest_headers("DELETE", path, "trade"), timeout = 30)
 
 
