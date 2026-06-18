@@ -197,7 +197,13 @@ class TickRecorder:
                     for cid, ch in ((1, "orderbook_delta"), (2, "trade")):
                         await ws.send(json.dumps({"id": cid, "cmd": "subscribe", "params": {
                             "channels": [ch], "market_tickers": self.all_tickers}}))
-                    print(f"Subscribed to {len(self.all_tickers)} tickers")
+                    # private fill channel (account-scoped, no market filter; the read
+                    # key can subscribe) so recordings carry which trades/orders are
+                    # OURS during live trading — match public trade_id to our fill's
+                    # trade_id, and client_order_id tags our own orderbook_deltas.
+                    await ws.send(json.dumps({"id": 3, "cmd": "subscribe",
+                                              "params": {"channels": ["fill"]}}))
+                    print(f"Subscribed to {len(self.all_tickers)} tickers + private fill")
                     async for raw in ws:
                         self.writer.write(time.time(), json.loads(raw))
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
