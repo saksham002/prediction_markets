@@ -903,11 +903,16 @@ class MMSimConsumer:
         if mm is None:
             return
         lts = self._cur_lts
-        if side == "yes":
+        # Direction comes from ACTION (buy = long yes / sell = short yes), NOT the
+        # book `side`. The real Kalshi fill reports side="yes" for BOTH buy-yes and
+        # sell-yes(=buy-no) fills, while sim reports side="no" for no orders — so
+        # `side` is not a reliable direction. `action` is the invariant across sim
+        # and prod (sell == short yes), so key the sign + cost basis off it.
+        if action == "buy":
             computed = mm.inventory[ticker] + qty
             own_price = round(yes_price, 6)
             self.pnl.trade(ticker, "long", qty, yes_price, is_maker = True)
-        else:
+        else:                                          # sell yes (= buy no) -> short
             computed = mm.inventory[ticker] - qty
             own_price = round(1.0 - yes_price, 6)
             self.pnl.trade(ticker, "short", qty, yes_price, is_maker = True)
