@@ -376,7 +376,9 @@ class ProdExchange:
     def place(self, decide_lts, ticker, side, price, qty):
         self._cur_lts = decide_lts
         coid = self.ids.coid()
-        price_cents = int(round((price if side == "yes" else round(1.0 - price, 6)) * 100))
+        # `price` is already in the SIDE's own space (yes-space for yes, no-space for
+        # no); api.create_order does the single no->yes conversion. Do NOT flip here.
+        price_cents = int(round(price * 100))
         action = "buy"
         try:
             resp = self.api.create_order(ticker, side, action, int(qty), price_cents,
