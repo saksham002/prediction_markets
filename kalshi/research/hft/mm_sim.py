@@ -188,16 +188,8 @@ class PairMM:
             # open position (reduce-only, no alpha); {} when flat
             return self._liquidate_quotes(ticker)
 
-        # Global budget guard. Note cross-leg "reducing" fills still consume
-        # cash (locked pairs), so over budget we allow ONLY same-ticker
-        # netting quotes (they free cash), sized to the open position. The
-        # 0.6*S term pre-reserves room for one more fill at typical prices.
-        budget = getattr(p, "budget", None)
-        S = p.per_order_size
-        over_budget = (
-            budget is not None
-            and self.consumer._deployed_dollars() + 0.6 * S > budget
-        )
+        # Budget is enforced per-order by _budget_clip below (entry size clipped to
+        # remaining // price), so there is no separate over-budget guard.
 
         # Risk variable the caps/skew operate on: per-ticker inventory by
         # default, or net pair exposure mapped into this leg's yes-space
@@ -249,33 +241,27 @@ class PairMM:
         def shape(side: str, price: float | None, sz: float) -> list[tuple[float, float]]:
             return [] if price is None else [(price, sz)]
 
-        if over_budget:
-            # Only same-ticker netting frees cash; cap size at the open
-            # position so the net never flips into new (cash-consuming) risk
-            tkr_inv = self.inventory[ticker]
-            if is_neg(tkr_inv) and yes_price is not None:
-                return {"yes": [(yes_price, min(size, -tkr_inv))]}
-            if is_pos(tkr_inv) and no_price is not None:
-                return {"no": [(no_price, min(size, tkr_inv))]}
-            return {}
-
         # square_off: the market-maker stance that always keeps the reducing
         # side quoted so inventory mean-reverts to flat. When off, only the
         # alpha-favored side is quoted (within position limits) and signal-
         # aligned inventory is allowed to ride to the cap. A pure-reduce order
         # is capped to |inv| so a fill flattens the position, never flips it.
         square_off = getattr(p, "square_off", False)
+        cap = p.inventory_cap
         desired = {}
-        add_yes = leg_alpha > -p.skew_threshold and inv + S <= p.inventory_cap
+        # add side: clip the order to BOTH the remaining budget and the remaining
+        # position-limit room (cap - inv for yes, inv + cap for no) so we top up to
+        # the cap instead of refusing a full-size order that would overshoot it.
+        add_yes = leg_alpha > -p.skew_threshold and inv < cap
         reduce_yes = square_off and is_neg(inv)
         if yes_price is not None and (add_yes or reduce_yes):
-            sz = self._budget_clip(size, yes_price) if add_yes else min(size, -inv)
+            sz = min(self._budget_clip(size, yes_price), cap - inv) if add_yes else min(size, -inv)
             if is_pos(sz):
                 desired["yes"] = shape("yes", yes_price, sz)
-        add_no = leg_alpha < p.skew_threshold and inv - S >= -p.inventory_cap
+        add_no = leg_alpha < p.skew_threshold and inv > -cap
         reduce_no = square_off and is_pos(inv)
         if no_price is not None and (add_no or reduce_no):
-            sz = self._budget_clip(size, no_price) if add_no else min(size, inv)
+            sz = min(self._budget_clip(size, no_price), inv + cap) if add_no else min(size, inv)
             if is_pos(sz):
                 desired["no"] = shape("no", no_price, sz)
         return desired
