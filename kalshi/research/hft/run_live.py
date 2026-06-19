@@ -62,8 +62,13 @@ def build_args():
 
     if args.config:
         c = json.load(open(args.config))
-        args.alpha_name, args.skew_threshold = c["alpha"], c["thr"]
-        args.per_order_size, args.inventory_cap = c["size"], c["cap"]
+        # Apply EVERY knob in the config onto args (the config is the full strategy
+        # spec so live reproduces the sweep exactly). 4 short aliases for back-compat
+        # with the sweep's auto-output; all other keys map 1:1 to arg names.
+        alias = {"alpha": "alpha_name", "thr": "skew_threshold",
+                 "size": "per_order_size", "cap": "inventory_cap"}
+        for k, v in c.items():
+            setattr(args, alias.get(k, k), v)
     args.combo = None
     if args.combo_file:
         args.combo = json.load(open(args.combo_file))
