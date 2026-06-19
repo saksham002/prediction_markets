@@ -188,8 +188,12 @@ class PairMM:
             # open position (reduce-only, no alpha); {} when flat
             return self._liquidate_quotes(ticker)
 
-        # Budget is enforced per-order by _budget_clip below (entry size clipped to
-        # remaining // price), so there is no separate over-budget guard.
+        # Optional pre-33fe652 behaviour, gated by free_budget: when over budget,
+        # quote ONLY reduce-only same-ticker netting (frees cash). Default off ->
+        # budget is enforced per-order by _budget_clip below (no separate guard).
+        over_budget = (getattr(p, "free_budget", False)
+                       and getattr(p, "budget", None) is not None
+                       and self.consumer._deployed_dollars() + 0.6 * p.per_order_size > p.budget)
 
         # Risk variable the caps/skew operate on: per-ticker inventory by
         # default, or net pair exposure mapped into this leg's yes-space
@@ -246,6 +250,15 @@ class PairMM:
         # alpha-favored side is quoted (within position limits) and signal-
         # aligned inventory is allowed to ride to the cap. A pure-reduce order
         # is capped to |inv| so a fill flattens the position, never flips it.
+        if over_budget:
+            # only same-ticker netting frees cash; cap at the open position so the
+            # net never flips into new (cash-consuming) risk
+            tkr_inv = self.inventory[ticker]
+            if is_neg(tkr_inv) and yes_price is not None:
+                return {"yes": [(yes_price, min(size, -tkr_inv))]}
+            if is_pos(tkr_inv) and no_price is not None:
+                return {"no": [(no_price, min(size, tkr_inv))]}
+            return {}
         square_off = getattr(p, "square_off", False)
         cap = p.inventory_cap
         desired = {}
@@ -590,7 +603,12 @@ class WCStrategy(SingleMM):
         if phase == "main":
             super().requote(lts)
             return
-        # liquidation: reduce-only, alpha-gated
+        # liquidation: reduce-only. liquidate_no_alpha (variant) = work the position
+        # to flat unconditionally; default = alpha-gated (only exit when the alpha
+        # supports the exit direction, else hold to settlement).
+        if getattr(self.params, "liquidate_no_alpha", False):
+            self._apply_desired(lts, self._exit_quotes(self.ticker), 0.0)
+            return
         alpha = self.alpha_engine.value_of(self.params.alpha_name, lts)
         alpha = 0.0 if alpha is None else alpha
         inv = self.inventory[self.ticker]

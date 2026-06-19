@@ -1,7 +1,8 @@
 """Print seconds-from-now at which the recorder job should END: the next 3am ET,
 pushed later if a game is still live then (so a recorder never dies mid-game).
-Capped at 48h (SLURM general-partition max). Used by run_recorder.sh to set
---time and the recorder --duration dynamically from the actual schedule."""
+Capped at 23.5h so the recorder job stays within 24h (run_recorder pads +30min
+for finalize -> SLURM --time <= 24h). Used by run_recorder.sh to set --time and
+the recorder --duration dynamically from the actual schedule."""
 import contextlib
 import datetime
 import sys
@@ -14,7 +15,7 @@ from research.hft.game_times import game_start
 
 ET = zoneinfo.ZoneInfo("America/New_York")
 MAX_GAME_S = 5 * 3600   # generous game length incl. extra innings / stoppage
-CAP_S = 48 * 3600
+CAP_S = 24 * 3600 - 1800   # 23.5h: run_recorder adds +30min finalize pad -> SLURM --time <= 24h
 QUIET_BUFFER_S = 1800   # end >=30min after the last game that overlaps 3am
 
 

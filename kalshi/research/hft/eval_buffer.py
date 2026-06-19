@@ -54,6 +54,7 @@ PARAM_DEFAULTS = {
     "fill_delay": 0.0,
     "fill_pub_lag": 0.0,
     "budget": 1000,
+    "free_budget": False,
     "aggro_entry": None,
     "aggro_limit": 300,
     "aggro_profit": 0.02,
