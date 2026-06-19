@@ -201,6 +201,12 @@ class SimExchange:
     def orders(self):
         return self.fill_engine.orders
 
+    def resting_for(self, coid: str):
+        """The live fill-engine RestingOrder for a coid (identity-preserving: its
+        queue_ahead is mutated in place as the queue drains), or None if gone."""
+        fe_oid = self._feoid_by_coid.get(coid)
+        return self.fill_engine.orders.get(fe_oid) if fe_oid is not None else None
+
     def set_deliver(self, cb):
         self.on_deliver = cb
 
@@ -361,9 +367,11 @@ class ProdExchange:
         self.ids = SimIds()                 # client_order_id minting (ours; UUIDs from prod too)
         self._orders: dict[str, _ProdRestingOrder] = {}   # handle(order_id) -> resting order
         self._coid_to_handle: dict[str, str] = {}
-        self._pending: list[tuple[str, dict]] = []        # (kind, msg) to deliver on next drain
+        self._pending: list[tuple[str, dict]] = []        # (kind, msg) for the sync drain (rare)
         self._own_trades: set[str] = set()                # trade_ids known to be ours
         self._cur_lts = 0.0
+        self._consumer = None                             # set in run(); for reconcile callbacks
+        self._tasks: set = set()                          # in-flight REST tasks (GC anchor)
 
     @property
     def orders(self):
@@ -372,30 +380,26 @@ class ProdExchange:
     def set_deliver(self, cb):
         self.on_deliver = cb
 
+    @property
+    def resting(self):
+        return self._orders
+
+    def resting_for(self, coid: str):
+        """The _ProdRestingOrder for a coid (queue_ahead is always 0 in prod), or None
+        while the order is still in-flight / already gone."""
+        return self._orders.get(self._coid_to_handle.get(coid))
+
     # ---- order entry (OrderRouter backend; same signature as SimExchange) ----
+    # NON-BLOCKING: place/cancel fire the blocking REST in a BACKGROUND task and return
+    # immediately, so the WS reader (run's `async for`) is never stalled on the round-
+    # trip. The router sits in *_INFLIGHT until the task completes and delivers the ack/
+    # reject on the loop; an ack-completion then reconcile()s the side off the LATEST
+    # target (so a price change made while in flight places the new price, not the old).
     def place(self, decide_lts, ticker, side, price, qty):
         self._cur_lts = decide_lts
         coid = self.ids.coid()
-        # `price` is already in the SIDE's own space (yes-space for yes, no-space for
-        # no); api.create_order does the single no->yes conversion. Do NOT flip here.
-        price_cents = int(round(price * 100))
-        action = "buy"
-        try:
-            resp = self.api.create_order(ticker, side, action, int(qty), price_cents,
-                                         client_order_id = coid)
-        except Exception as e:                       # network error -> treat as reject
-            self._pending.append(("reject", {"client_order_id": coid, "kind": "place", "err": str(e)}))
-            return None, coid
-        if resp.status_code in (200, 201):
-            order_id = resp.json()["order_id"]            # V2 response is flat (no "order" wrapper)
-            self._orders[order_id] = _ProdRestingOrder(ticker, side, price, float(qty), coid)
-            self._coid_to_handle[coid] = order_id
-            self._pending.append(("ack", ack_msg(ticker, side, coid, order_id, "place",
-                                                 self._ms(decide_lts))))
-            return order_id, coid
-        # 429 rate-limit or hard 4xx -> the order did not rest; free the side
-        self._pending.append(("reject", {"client_order_id": coid, "kind": "place",
-                                         "status": resp.status_code}))
+        self._spawn(self._do_place(coid, ticker, side, price, float(qty)))
+        # handle is unknown until the ack lands; the router tracks by coid (resting_for)
         return None, coid
 
     def cancel(self, decide_lts, coid):
@@ -403,24 +407,78 @@ class ProdExchange:
         handle = self._coid_to_handle.get(coid)
         order = self._orders.get(handle) if handle else None
         if order is None:
-            return
+            return                       # already gone (filled); router shouldn't call this
+        self._spawn(self._do_cancel(coid, order.ticker, order.side, handle))
+
+    def _spawn(self, coro):
+        """Schedule a background REST task on the running loop and anchor it so it is
+        not garbage-collected before completion."""
+        import asyncio
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _do_place(self, coid, ticker, side, price, qty):
+        """Run the blocking create_order off the event loop; on the loop, record the
+        handle, deliver the ack/reject, and reconcile the side off the latest target."""
+        import asyncio
+        import time
         try:
-            resp = self.api.cancel_order(handle)
+            # `price` is already in the SIDE's own space (yes-space for yes, no-space
+            # for no); api.create_order does the single no->yes conversion. Do NOT flip.
+            price_cents = int(round(price * 100))
+            try:
+                resp = await asyncio.to_thread(self.api.create_order, ticker, side, "buy",
+                                               int(qty), price_cents, client_order_id = coid)
+            except Exception as e:                   # network error -> treat as reject
+                self._emit("reject", {"client_order_id": coid, "kind": "place", "err": str(e)})
+                return
+            now = time.time()
+            if resp.status_code in (200, 201):
+                order_id = resp.json()["order_id"]   # V2 response is flat (no "order" wrapper)
+                self._orders[order_id] = _ProdRestingOrder(ticker, side, price, qty, coid)
+                self._coid_to_handle[coid] = order_id
+                self._emit("ack", ack_msg(ticker, side, coid, order_id, "place", self._ms(now)))
+                self._reconcile(now, ticker, side)   # confirm RESTING / re-cancel if target moved
+            else:                                    # 429 / hard 4xx -> order did not rest; free side
+                self._emit("reject", {"client_order_id": coid, "kind": "place",
+                                      "status": resp.status_code})
+        except Exception as e:                       # never let a task die silently
+            print(f"_do_place error: {type(e).__name__}: {e}")
+
+    async def _do_cancel(self, coid, ticker, side, handle):
+        import asyncio
+        import time
+        try:
+            try:
+                resp = await asyncio.to_thread(self.api.cancel_order, handle)
+            except Exception as e:
+                self._emit("reject", {"client_order_id": coid, "kind": "cancel", "err": str(e)})
+                return
+            now = time.time()
+            if resp.status_code in (200, 404):       # 404 == already gone (filled) -> cancelled
+                self._orders.pop(handle, None)
+                self._coid_to_handle.pop(coid, None)
+                self._emit("ack", ack_msg(ticker, side, coid, handle, "cancel", self._ms(now)))
+                self._reconcile(now, ticker, side)   # IDLE now -> place the (latest) target
+            else:                                    # 429 / hard 4xx -> cancel failed, order still resting
+                self._emit("reject", {"client_order_id": coid, "kind": "cancel",
+                                      "status": resp.status_code})
         except Exception as e:
-            self._pending.append(("reject", {"client_order_id": coid, "kind": "cancel", "err": str(e)}))
-            return
-        if resp.status_code in (200, 404):           # 404 == already gone (filled) -> treat as cancelled
-            self._orders.pop(handle, None)
-            self._coid_to_handle.pop(coid, None)
-            self._pending.append(("ack", ack_msg(order.ticker, order.side, coid, handle, "cancel",
-                                                 self._ms(decide_lts))))
-        else:                                        # 429 / hard 4xx -> cancel failed, order still resting
-            self._pending.append(("reject", {"client_order_id": coid, "kind": "cancel",
-                                             "status": resp.status_code}))
+            print(f"_do_cancel error: {type(e).__name__}: {e}")
+
+    def _emit(self, kind: str, msg: dict):
+        if self.on_deliver is not None:
+            self.on_deliver(kind, msg)
+
+    def _reconcile(self, now: float, ticker: str, side: str):
+        if self._consumer is not None:
+            self._consumer.router.reconcile(now, ticker, side)
 
     def drain(self, now: float):
-        """Flush synchronous REST confirmations (place/cancel ack or reject). The
-        public own-delta + private fill arrive asynchronously on the WS (run())."""
+        """Flush any stray synchronous confirmations. In the async model place/cancel
+        deliver their ack/reject from the background task (via _emit), so _pending is
+        normally empty and this is a no-op; kept for the shared backend API."""
         self._cur_lts = max(self._cur_lts, now)
         if self.on_deliver is None:
             return
@@ -465,7 +523,9 @@ class ProdExchange:
         import time
         import websockets
         from src.utils.api import WS_URL, ws_auth_headers
+        self._consumer = consumer                       # for the async reconcile callbacks
         asyncio.create_task(self._watchdog(consumer))   # independent reconciliation loop
+        asyncio.create_task(self._reconcile_timer(consumer))  # rate-limit/reject deferral net
         while True:
             try:
                 async with websockets.connect(WS_URL, additional_headers = ws_auth_headers()) as ws:
@@ -481,6 +541,18 @@ class ProdExchange:
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
                 print(f"ProdExchange reconnect ({type(e).__name__}: {e}) in 5s...")
                 await asyncio.sleep(5)
+
+    # ---- fast reconcile timer: fire rate-limit / reject-deferred steps even when
+    #      the market is quiet (no new event would otherwise re-drive reconcile) ----
+    async def _reconcile_timer(self, consumer, period=0.05):
+        import asyncio
+        import time
+        while True:
+            await asyncio.sleep(period)
+            try:
+                consumer.router.reconcile_all(time.time())
+            except Exception as e:
+                print(f"reconcile_timer error: {type(e).__name__}: {e}")
 
     # ---- watchdog: time-based reconciliation vs exchange truth (B6/B9) ----
     async def _watchdog(self, consumer, period=10.0, stuck_after=20.0):
@@ -515,7 +587,7 @@ class ProdExchange:
                     exists = bool(handle and handle in resting)
                     print(f"WATCHDOG: {key} stuck in-flight {now - t0:.0f}s -> "
                           f"exchange resting={exists}; reconciling")
-                    router.reconcile_side(ticker, side, exists)
+                    router.force_state(ticker, side, exists)
                     if not exists and handle:
                         self._orders.pop(handle, None)
                         self._coid_to_handle.pop(coid, None)

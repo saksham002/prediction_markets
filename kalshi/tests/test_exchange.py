@@ -8,8 +8,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from collections import defaultdict
 
+import asyncio
+
 from research.hft.exchange import (
-    SimIds, Scheduler, SimExchange, own_delta_msg, public_trade_msg, private_fill_msg, ack_msg,
+    SimIds, Scheduler, SimExchange, ProdExchange,
+    own_delta_msg, public_trade_msg, private_fill_msg, ack_msg,
 )
 from research.hft.market_view import MarketView
 from research.hft.order_router import OrderRouter, IDLE, PLACE_INFLIGHT, RESTING, CANCEL_INFLIGHT
@@ -27,7 +30,7 @@ def _setup(ack_delay = 0.0, pub_delay = 0.0):
     sim = SimExchange(view, ack_delay = ack_delay, pub_delay = pub_delay)
     fills = []
     router = OrderRouter(sim, view,
-                         on_reduce = lambda t, s, q, px, act, rsn: fills.append((t, s, q, px, act, rsn)))
+                         on_reduce = lambda t, s, q, px, act, rsn, post: fills.append((t, s, q, px, act, rsn)))
 
     def deliver(kind, msg):
         if kind == "public_delta":
@@ -190,3 +193,73 @@ def test_inflight_lock_blocks_same_side_until_confirmation():
     assert router.state("M", "yes") == CANCEL_INFLIGHT  # locked again
     sim.drain(2.010)
     assert router.state("M", "yes") == IDLE
+
+
+# ---- ProdExchange: non-blocking place/cancel (async REST off the event loop) ----
+class _FakeResp:
+    def __init__(self, status, oid = None):
+        self.status_code = status
+        self._oid = oid
+
+    def json(self):
+        return {"order_id": self._oid}
+
+
+class _FakeApi:
+    """Records calls; create_order/cancel_order are synchronous (run via to_thread)."""
+    def __init__(self):
+        self.created = []
+        self.cancelled = []
+
+    def create_order(self, ticker, side, action, count, price_cents, *, client_order_id = None):
+        self.created.append((ticker, side, action, count, price_cents, client_order_id))
+        return _FakeResp(201, oid = "H1")
+
+    def cancel_order(self, handle):
+        self.cancelled.append(handle)
+        return _FakeResp(200)
+
+
+class _StubConsumer:
+    def __init__(self, router):
+        self.router = router
+
+
+def _setup_prod(api):
+    books = defaultdict(MarketBook)
+    books["M"].yes.load_snapshot([["0.5000", "100.00"]])
+    view = MarketView(books)
+    prod = ProdExchange(view, ["M"], api = api)
+    router = OrderRouter(prod, view)
+
+    def deliver(kind, msg):
+        if kind == "ack":
+            router.on_ack(msg)
+        elif kind == "reject":
+            router.on_reject(msg["client_order_id"], msg["kind"])
+    prod.set_deliver(deliver)
+    prod._consumer = _StubConsumer(router)     # set in run() live; injected here
+    return view, prod, router
+
+
+def test_prod_place_is_nonblocking_then_acks_async():
+    async def scenario():
+        api = _FakeApi()
+        view, prod, router = _setup_prod(api)
+        router.set_target(1.0, "M", "yes", (0.50, 10.0), {"event": "E"})
+        # place() returned WITHOUT doing the REST: the side is in-flight and the REST
+        # task hasn't even started (no create_order recorded yet).
+        assert router.state("M", "yes") == PLACE_INFLIGHT
+        assert api.created == []
+        await asyncio.sleep(0.05)              # let the background REST task run
+        assert len(api.created) == 1
+        assert router.state("M", "yes") == RESTING        # ack delivered async
+        assert router.resting_order("M", "yes") is not None
+        # cancel is likewise non-blocking and frees the side on the async ack
+        router.set_target(2.0, "M", "yes", None, {"event": "E"})
+        assert router.state("M", "yes") == CANCEL_INFLIGHT
+        assert api.cancelled == []
+        await asyncio.sleep(0.05)
+        assert api.cancelled == ["H1"]
+        assert router.state("M", "yes") == IDLE
+    asyncio.run(scenario())

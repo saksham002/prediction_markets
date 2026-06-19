@@ -112,6 +112,10 @@ class MarketView:
         self.books: dict[str, MarketBook] = books if books is not None else defaultdict(MarketBook)
         # our resting qty: (ticker, side) -> {price_key: qty}
         self._own: dict[tuple[str, str], dict[str, float]] = {}
+        # monotonic mutation counter of the own-ledger per (ticker, side); the obi
+        # cache keys on it alongside BookSide._ver, since market-only obi = book minus
+        # the ledger and a register without a paired book delta must invalidate it.
+        self._own_ver: dict[tuple[str, str], int] = {}
         self._own_trade_ids: set[str] = set()
 
     # ---- own-resting ledger (driven by OrderRouter) ----
@@ -123,6 +127,12 @@ class MarketView:
                 self._own.pop((ticker, side), None)
         else:
             level[price_key_str] = qty
+        key = (ticker, side)
+        self._own_ver[key] = self._own_ver.get(key, 0) + 1
+
+    def own_ver(self, ticker: str, side: str) -> int:
+        """Own-ledger mutation counter for (ticker, side) — the obi cache token."""
+        return self._own_ver.get((ticker, side), 0)
 
     def release(self, ticker: str, side: str, price_key_str: str):
         self.register(ticker, side, price_key_str, 0.0)

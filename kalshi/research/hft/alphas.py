@@ -115,12 +115,17 @@ class PairAlphaEngine(_OwnOrderMixin):
                               float(msg["delta_fp"]), ts)
 
     def _pair_obi(self) -> float | None:
-        # cache per book-state: obi is recomputed only when a book changed (any
-        # apply_delta/load_snapshot bumps BookSide._ver). Market-only obi is
-        # invariant to our own deltas, so an own delta just forces a recompute to
-        # the same value -> result is identical to recomputing every call.
-        bf, bs = self.view.books[self.first_ticker], self.view.books[self.second_ticker]
-        tok = (bf.yes._ver, bf.no._ver, bs.yes._ver, bs.no._ver)
+        # cache per book+ledger state: market-only obi = book minus our own-resting
+        # ledger, so the token spans BOTH BookSide._ver (any apply_delta/load_snapshot
+        # bumps it) AND the own-ledger version (register bumps it). In the real flow an
+        # own delta bumps book._ver and the ledger together (same market-only obi -> a
+        # recompute to the same value); a standalone register (no paired book delta)
+        # now also invalidates -> obi correctly drops our qty.
+        v, vt = self.view, (self.first_ticker, self.second_ticker)
+        bf, bs = v.books[vt[0]], v.books[vt[1]]
+        tok = (bf.yes._ver, bf.no._ver, bs.yes._ver, bs.no._ver,
+               v.own_ver(vt[0], "yes"), v.own_ver(vt[0], "no"),
+               v.own_ver(vt[1], "yes"), v.own_ver(vt[1], "no"))
         if getattr(self, "_pobi_tok", None) != tok:
             self._pobi_tok = tok
             of, osd = self.view.obi(self.first_ticker), self.view.obi(self.second_ticker)
@@ -333,10 +338,12 @@ class SingleAlphaEngine(_OwnOrderMixin):
         return (yb + (1.0 - nb)) / 2
 
     def _obi(self) -> float | None:
-        # cache per book-state (see PairAlphaEngine._pair_obi): recompute only when
-        # a book changed; identical result to recomputing every call.
+        # cache per book+ledger state (see PairAlphaEngine._pair_obi): the token spans
+        # BookSide._ver AND the own-ledger version, so a register (with or without a
+        # paired book delta) invalidates and obi excludes our own resting qty.
         book = self.view.books[self.ticker]
-        tok = (book.yes._ver, book.no._ver)
+        tok = (book.yes._ver, book.no._ver,
+               self.view.own_ver(self.ticker, "yes"), self.view.own_ver(self.ticker, "no"))
         if getattr(self, "_obi_tok", None) != tok:
             self._obi_tok = tok
             self._obi_cache = self.view.obi(self.ticker)

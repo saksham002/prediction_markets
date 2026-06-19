@@ -32,8 +32,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine
-from research.hft.passive_fill import FORWARD_DELAY_S, PassiveFillEngine, price_key
-from research.hft.order_router import OrderRouter, PLACE_INFLIGHT, CANCEL_INFLIGHT
+from research.hft.passive_fill import FORWARD_DELAY_S, PassiveFillEngine
+from research.hft.order_router import OrderRouter
 from research.hft.exchange import SimExchange
 from src.utils.feps import is_pos, is_neg, is_zero, lte
 from research.hft.replay import Replayer
@@ -279,62 +279,13 @@ class PairMM:
 
     def _reconcile_side(self, lts: float, ticker: str, side: str,
                         want, alpha, expo, event):
-        """Cancel-before-replace for the single resting order on (ticker, side),
-        via OrderRouter (which enforces <=1 resting/side). `want` is (price,size)
-        or None. Market-state reads go through the consumer's MarketView so they
-        exclude our own resting orders when live."""
-        router = self.consumer.router
-        view = self.consumer.view
-        limiter = self.consumer.rate_limiter
-        max_queue = getattr(self.params, "max_queue_ahead", None)
-        # In-flight lock: one outstanding action per (ticker, side). While a place/
-        # cancel is unconfirmed, do nothing this tick. (Vacuous at delay 0: place/
-        # cancel confirm inline, so the side is never in-flight here.)
-        if router.state(ticker, side) in (PLACE_INFLIGHT, CANCEL_INFLIGHT):
-            return
-        cur = router.resting_order(ticker, side)       # non-None iff RESTING
-        if want is None:
-            if cur is not None and limiter.try_cancel(lts):
-                router.cancel(lts, ticker, side)
-                self.consumer.log_order(lts, event, ticker, side, "cancel",
-                                        cur.price_f, cur.remaining, alpha,
-                                        cur.queue_ahead, expo)
-            return
-        pk = price_key(want[0])
-        if cur is not None:
-            # Passive invariant: only rest where real liquidity backs the level;
-            # a level emptied by a cancel is unsupported -> pull it
-            supported = is_pos(view.depth(ticker, side, cur.price))
-            if supported and cur.price == pk:
-                return                                 # keep queue position
-            if limiter.try_cancel(lts):
-                router.cancel(lts, ticker, side)
-                self.consumer.log_order(lts, event, ticker, side, "cancel",
-                                        cur.price_f, cur.remaining, alpha,
-                                        cur.queue_ahead, expo)
-            else:                                      # rate-limited: keep order, retry later
-                self.consumer.log_order(lts, event, ticker, side, "rate_limited",
-                                        cur.price_f, cur.remaining, alpha,
-                                        cur.queue_ahead, expo)
-                return                                 # SKIP place -> never stack
-        # place only if the side is free now (delay 0: cancel completed inline;
-        # delay>0: a just-sent cancel is still in flight -> defer to a later tick)
-        if not router.can_place(ticker, side):
-            return
-        # Passive invariant: never create a price level with no real backing
-        if lte(view.depth(ticker, side, pk), 0):
-            return
-        # Queue-depth guard: a fresh join behind a huge displayed queue only
-        # fills when the level breaks (worst selection)
-        if max_queue is not None and view.depth(ticker, side, pk) > max_queue:
-            return
-        if not limiter.try_place(lts):
-            return                                     # rate-limited: place retries later
-        router.place(lts, ticker, side, want[0], want[1])
-        o = router.resting_order(ticker, side)         # RESTING at delay 0
-        qa = o.queue_ahead if o is not None else view.depth(ticker, side, pk)
-        self.consumer.log_order(lts, event, ticker, side, "place",
-                                want[0], want[1], alpha, qa, expo)
+        """Declare the desired resting order for (ticker, side) — `want` is (price,size)
+        or None — and let the OrderRouter drive the exchange toward it. The strategy is
+        UNAWARE of in-flight / pending-ack / rate-limit state: the router owns the
+        in-flight lock, the write-budget gating, the passive-level invariants, and the
+        order logging (see order_router.reconcile)."""
+        self.consumer.router.set_target(lts, ticker, side, want,
+                                        {"event": event, "alpha": alpha, "expo": expo})
 
     def requote(self, lts: float):
         per_leg = getattr(self.params, "per_leg_alpha", False)
@@ -625,18 +576,11 @@ class WCStrategy(SingleMM):
         return "main"
 
     def _cancel_all(self, lts: float):
-        router = self.consumer.router
-        lim = self.consumer.rate_limiter
+        # Want no order on either side; the router cancels any resting order (rate-limit
+        # gated, retried later if budget is exhausted) and logs it.
+        ctx = {"event": self.event_ticker, "alpha": None, "expo": self.inventory[self.ticker]}
         for side in ("yes", "no"):
-            cur = router.resting_order(self.ticker, side)   # non-None iff RESTING (not in-flight)
-            if cur is None:
-                continue
-            if lim.try_cancel(lts):
-                router.cancel(lts, self.ticker, side)
-                self.consumer.log_order(lts, self.event_ticker, self.ticker, side, "cancel",
-                                        cur.price_f, cur.remaining, None,
-                                        cur.queue_ahead, self.inventory[self.ticker])
-            # rate-limited: order stays resting, retried next tick
+            self.consumer.router.set_target(lts, self.ticker, side, None, ctx)
 
     def requote(self, lts: float):
         phase = self._phase(lts)
@@ -692,10 +636,18 @@ class MMSimConsumer:
                 on_deliver = self._deliver,
             )
             self.fill_engine = self.exchange.fill_engine     # alias (queue reads)
-        # the ONLY path passive orders flow through (in-flight lock; routes PnL/
-        # inventory off the authoritative private fill via _on_fill_reduce)
-        self.router = OrderRouter(self.exchange, self.view, on_reduce = self._on_fill_reduce,
-                                  on_order = self._log_order_timing if self._timing else None)
+        # shared write-budget limiter (also used directly by the taker/aggro path);
+        # constructed before the router, which owns the passive place/cancel gating.
+        self.rate_limiter = WriteRateLimiter(getattr(params, "write_budget", WRITE_BUDGET))
+        # the ONLY path passive orders flow through (desired-state: the strategy sets a
+        # target per side; the router owns the in-flight lock, rate-limit budget, passive
+        # invariants, logging, and routes PnL/inventory off the authoritative fill).
+        self.router = OrderRouter(self.exchange, self.view,
+                                  rate_limiter = self.rate_limiter,
+                                  max_queue = getattr(params, "max_queue_ahead", None),
+                                  on_reduce = self._on_fill_reduce,
+                                  on_order = self._log_order_timing if self._timing else None,
+                                  log = self.log_order)
         self._cur_lts = 0.0          # lts of the recorded message being processed
         self._fill_flag = False      # a fill landed this tick -> requote
         # debug: shadow recorded-market book to assert market-only reads (book minus
@@ -711,7 +663,6 @@ class MMSimConsumer:
         self.fill_rows: list[dict] = []
         self.last_mid: dict[str, float] = {}
         self.peak_deployed: float = 0.0
-        self.rate_limiter = WriteRateLimiter(getattr(params, "write_budget", WRITE_BUDGET))
         # Periodic per-strategy state snapshots for visualization/refit
         self.state_rows: list[dict] = []
         self._last_state_log: dict[str, float] = {}
