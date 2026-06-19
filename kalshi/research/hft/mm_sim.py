@@ -593,10 +593,27 @@ class WCStrategy(SingleMM):
     def __init__(self, event_ticker, ticker, consumer, params):
         super().__init__(event_ticker, ticker, consumer, params)
         from espn_clock import clocks_for
-        self.clock = clocks_for(event_ticker)
+        self.clock = clocks_for(event_ticker)        # sim: static file cache (asserted below)
+        # live-data runs (paper/live): MAIN polls ESPN every 10s into
+        # consumer.live_clocks (in-memory); _phase reads from there so KO/HT/SH/FT/
+        # goals appear as the game progresses. Replay/sweep reads the static clock.
+        self._live_clock = getattr(params, "live_clock", False)
+        # live testing before kickoff: skip phase-gating entirely (always "main")
+        self._ignore_clock = getattr(params, "ignore_clock", False)
+        # SIM (replay/sweep) MUST have a real game clock — otherwise WCStrategy
+        # silently runs the WHOLE game in "main" phase (no no-trade/half-time/85'
+        # liquidate gating), i.e. trades outside the right bounds. Fail LOUDLY here
+        # instead. (Skipped for live and with --ignore-clock.)
+        if not self._live_clock and not self._ignore_clock:
+            assert self.clock and "ko" in self.clock, (
+                f"WCStrategy: no game clock for {event_ticker}. Run espn_clock.py to "
+                f"populate wc_clocks.json — refusing to sim ungated (see project_status).")
 
     def _phase(self, lts: float) -> str:
-        c = self.clock
+        if self._ignore_clock:
+            return "main"                              # live test: trade regardless of clock
+        c = (getattr(self.consumer, "live_clocks", {}).get(self.event_ticker)
+             if self._live_clock else self.clock)      # live: in-memory (main poller); sim: static
         if not c or "ko" not in c:
             return "main"
         if lts < c["ko"] + 300:                       # before KO + 5min

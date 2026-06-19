@@ -18,6 +18,7 @@ import json
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -229,11 +230,39 @@ async def build_and_run(args, pairs, extra_events, out_dir, write_at_end = True)
     """Build the consumer + run the driver (paper LiveFeed / live ProdExchange).
     The launcher passes write_at_end=False (the separate logger persists everything;
     main does no file I/O)."""
+    args.live_clock = True            # live-data run: WCStrategy reads consumer.live_clocks
     feed = LiveFeed(args.tickers)
     consumer = MMSimConsumer(feed, args)
+    consumer.live_clocks = {}         # event_ticker -> ESPN clock (live game-phase gating)
     feed.consumer = consumer
     feed.state_dir = out_dir if write_at_end else None     # None -> no periodic dumps
     consumer.on_meta(time.time(), {"pairs": pairs, "events": extra_events})
+    # WC phase gating: MAIN polls ESPN every 10s into consumer.live_clocks (in-memory;
+    # no file, no logger round-trip). Scheduled-KO is provisional pre-kickoff; KO/HT/
+    # SH/FT/goals overwrite it live. Initial sync poll first so phases gate from t0.
+    if getattr(args, "football", False):
+        from espn_clock import fetch_clock
+        soccer = [e for e in ([p["event_ticker"] for p in pairs] +
+                              [e["event_ticker"] for e in extra_events])
+                  if e.startswith("KXWCGAME") or e.startswith("KXINTLFRIENDLY")]
+
+        def _poll_once():
+            for ev in soccer:
+                try:
+                    c = fetch_clock(ev, live = True)
+                    if c:
+                        consumer.live_clocks[ev] = c
+                except Exception as ex:
+                    print(f"clock poll {ev}: {ex}")
+
+        def _poll_loop():
+            while True:
+                time.sleep(10)
+                _poll_once()
+
+        if soccer:
+            _poll_once()                                   # before the first event
+            threading.Thread(target = _poll_loop, daemon = True).start()
     driver = consumer.exchange.run(consumer) if args.live else feed.run()
     if args.live:
         print("*** LIVE REAL-ORDER MODE — placing real orders via the trade key ***")
@@ -282,6 +311,8 @@ async def main():
                         help = "combo weights JSON from fit_combo.py (use with -a combo)")
     parser.add_argument("--football", action = "store_true",
                         help = "WC/soccer phase strategy (WCStrategy) for KXWCGAME/KXINTLFRIENDLYGAME")
+    parser.add_argument("--ignore-clock", action = "store_true",
+                        help = "live testing: skip WC phase-gating (trade regardless of game clock)")
     parser.add_argument("--budget", type = float, default = None,
                         help = "Global deployed-dollars cap (e.g. 1000); None = no cap")
     parser.add_argument("--realistic", action = "store_true",

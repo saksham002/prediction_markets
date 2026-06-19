@@ -32,5 +32,10 @@ fi
 # --- inside the SLURM job: record, then resubmit the next window ---
 $PY "$HFT/record_ticks.py" --series "$KREC_SERIES" --extra-series "$KREC_EXTRA" \
     --top-n 18 --extra-top-n 10 --duration "$KREC_DUR"
+# wrap-up: add the just-recorded games' ESPN clocks (KO/HT/SH/FT + goals) to
+# wc_clocks.json so WCStrategy phase-gates them next time (games are finished by
+# the 3am window end, so keyEvents exist). Reads dataset tickers; non-fatal.
+echo "updating WC game clocks from ESPN..."
+$PY "$HFT/espn_clock.py" || echo "clock update failed (non-fatal)"
 echo "recorder exited cleanly; resubmitting next window"
 KALSHI_REC_CHILD=0 bash "$SELF"

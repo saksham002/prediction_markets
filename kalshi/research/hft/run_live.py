@@ -45,6 +45,8 @@ def build_args():
     p.add_argument("--extra-top-n", type = int, default = 8)
     p.add_argument("--min-volume", type = float, default = 25_000)
     p.add_argument("--football", action = "store_true", help = "WCStrategy (KXWCGAME)")
+    p.add_argument("--ignore-clock", action = "store_true",
+                   help = "live testing: skip WC phase-gating (trade regardless of game clock)")
     p.add_argument("--forward-delay", type = float, default = FORWARD_DELAY_S)
     p.add_argument("--max-spread", type = float, default = 0.02)
     p.add_argument("--price-min", type = float, default = 0.05)

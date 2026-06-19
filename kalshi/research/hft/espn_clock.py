@@ -19,7 +19,7 @@ SUM = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?e
 MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
           "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
 # ESPN abbreviation -> Kalshi ticker abbreviation (where they differ)
-ALIAS = {"HAI": "HTI"}
+ALIAS = {"HAI": "HTI", "IRN": "IRI", "ALG": "DZA"}
 
 
 def _get(url):
@@ -40,7 +40,11 @@ def _parse(event_ticker):
     return date, teams
 
 
-def fetch_clock(event_ticker):
+def fetch_clock(event_ticker, live = False):
+    """Past games: keyEvent wallclocks (ko/ht/sh/ft + goals). `live=True` (live
+    trading): if the match hasn't produced a Kickoff keyEvent yet, fall back to the
+    scoreboard's SCHEDULED start as a provisional `ko` so pre-match gating works;
+    the real KO/HT/SH/FT overwrite it as the game progresses."""
     date, teams = _parse(event_ticker)
     if not date:
         return None
@@ -49,7 +53,7 @@ def fetch_clock(event_ticker):
     except Exception as e:
         print(f"  {event_ticker}: scoreboard fetch failed ({e})")
         return None
-    eid, id2ab = None, {}
+    eid, id2ab, sched = None, {}, None
     for ev in sb.get("events", []):
         comp = ev["competitions"][0]["competitors"]
         abbrs = [ALIAS.get(c["team"].get("abbreviation", ""), c["team"].get("abbreviation", ""))
@@ -57,6 +61,7 @@ def fetch_clock(event_ticker):
         if len(abbrs) == 2 and (abbrs[0] + abbrs[1] == teams or abbrs[1] + abbrs[0] == teams):
             eid = ev["id"]
             id2ab = {c["team"]["id"]: a for c, a in zip(comp, abbrs)}
+            sched = _iso(ev["date"]) if ev.get("date") else None   # scheduled KO
             break
     if eid is None:
         print(f"  {event_ticker}: no ESPN event matched (teams={teams})")
@@ -84,7 +89,11 @@ def fetch_clock(event_ticker):
             events.append({"wc": _iso(wc), "min": (ke.get("clock") or {}).get("displayValue", ""),
                            "kind": "goal" if is_goal else "red", "team": id2ab.get(tm, "")})
     if "ko" not in out:
-        return None
+        if live and sched is not None:
+            out["ko"] = sched                 # provisional scheduled KO (no keyEvents yet)
+            out["provisional"] = True
+        else:
+            return None
     out["events"] = events
     return out
 
