@@ -152,6 +152,16 @@ class PairMM:
             return {"no": [(round(1.0 - tob.yes_ask, 6), min(S, inv))]}
         return {}
 
+    def _budget_clip(self, size: float, price: float) -> float:
+        """Clip an ENTRY (cash-consuming) order to what the remaining budget can
+        buy at this price: min(size, (budget - deployed) // price) whole contracts.
+        No-op when no budget set. Reduce/netting orders free cash and are NOT clipped."""
+        budget = getattr(self.params, "budget", None)
+        if budget is None or not is_pos(price):
+            return size
+        affordable = max(0.0, budget - self.consumer._deployed_dollars()) // price
+        return min(size, affordable)
+
     def _desired_sides(self, ticker: str, leg_alpha: float, lts: float = 0.0) -> dict:
         """Map of side -> [(price, size)] quotes to rest, per the skew rules."""
         p = self.params
@@ -259,13 +269,15 @@ class PairMM:
         add_yes = leg_alpha > -p.skew_threshold and inv + S <= p.inventory_cap
         reduce_yes = square_off and is_neg(inv)
         if yes_price is not None and (add_yes or reduce_yes):
-            sz = size if add_yes else min(size, -inv)
-            desired["yes"] = shape("yes", yes_price, sz)
+            sz = self._budget_clip(size, yes_price) if add_yes else min(size, -inv)
+            if is_pos(sz):
+                desired["yes"] = shape("yes", yes_price, sz)
         add_no = leg_alpha < p.skew_threshold and inv - S >= -p.inventory_cap
         reduce_no = square_off and is_pos(inv)
         if no_price is not None and (add_no or reduce_no):
-            sz = size if add_no else min(size, inv)
-            desired["no"] = shape("no", no_price, sz)
+            sz = self._budget_clip(size, no_price) if add_no else min(size, inv)
+            if is_pos(sz):
+                desired["no"] = shape("no", no_price, sz)
         return desired
 
     def _leg_alpha_per_leg(self, lts: float, ticker: str, leg_sign: float) -> float:
@@ -426,6 +438,7 @@ class SingleMM:
 
     # Reuse PairMM quoting/booking logic with per-market settings
     _desired_sides = PairMM._desired_sides
+    _budget_clip = PairMM._budget_clip
     _exit_quotes = PairMM._exit_quotes
     _liquidate_quotes = PairMM._liquidate_quotes
     _reconcile_side = PairMM._reconcile_side
