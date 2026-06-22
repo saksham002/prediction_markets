@@ -24,6 +24,7 @@ import os
 import signal
 import sys
 import time
+import zlib
 from collections import defaultdict
 from pathlib import Path
 
@@ -296,22 +297,35 @@ def finalize_games(staging: Path, dataset: Path, sub: Path, min_cts: float = MIN
     rewrite. Generalizes across leagues (2-leg pairs, N-leg events)."""
     dataset.mkdir(parents = True, exist_ok = True)
     sub.mkdir(parents = True, exist_ok = True)
+    corrupt = DATA_ROOT / "games_corrupt"
     for path in sorted(staging.glob("*.jsonl.gz")):
         meta_line, legs, last_trade, rows = None, [], None, []
         vol: dict[str, float] = defaultdict(float)
-        with gzip.open(path, "rt") as f:
-            for line in f:
-                r = json.loads(line)
-                if "meta" in r:
-                    meta_line = line if line.endswith("\n") else line + "\n"
-                    g = (r["meta"]["pairs"] or r["meta"]["events"])[0]
-                    legs = list(g["tickers"]) if "tickers" in g else [g["first_ticker"], g["second_ticker"]]
-                    continue
-                rows.append((r["lts"], line if line.endswith("\n") else line + "\n"))
-                m = r["d"].get("msg", {})
-                if r["d"].get("type") == "trade":
-                    vol[m["market_ticker"]] += float(m["count_fp"])
-                    last_trade = r["lts"]
+        try:
+            with gzip.open(path, "rt") as f:
+                for line in f:
+                    r = json.loads(line)
+                    if "meta" in r:
+                        meta_line = line if line.endswith("\n") else line + "\n"
+                        g = (r["meta"]["pairs"] or r["meta"]["events"])[0]
+                        legs = list(g["tickers"]) if "tickers" in g else [g["first_ticker"], g["second_ticker"]]
+                        continue
+                    rows.append((r["lts"], line if line.endswith("\n") else line + "\n"))
+                    m = r["d"].get("msg", {})
+                    if r["d"].get("type") == "trade":
+                        vol[m["market_ticker"]] += float(m["count_fp"])
+                        last_trade = r["lts"]
+        except (EOFError, OSError, zlib.error, json.JSONDecodeError) as e:
+            # Truncated/interleaved gzip (crashed or duplicate writer): quarantine
+            # this one file and keep going. A single unreadable game must NOT abort
+            # the whole finalize — it used to, stranding every game in staging.
+            corrupt.mkdir(parents = True, exist_ok = True)
+            dst = corrupt / path.name
+            if dst.exists():
+                dst = corrupt / f"{path.stem}.{int(time.time())}.gz"
+            path.rename(dst)
+            print(f"  CORRUPT {path.name}: {type(e).__name__}: {e} -> {corrupt.name}/")
+            continue
         keep = max((vol.get(t, 0.0) for t in legs), default = 0.0) >= min_cts
         dst = (dataset if keep else sub) / path.name
         if dst.exists():
