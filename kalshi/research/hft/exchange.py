@@ -427,22 +427,27 @@ class ProdExchange:
             # `price` is already in the SIDE's own space (yes-space for yes, no-space
             # for no); api.create_order does the single no->yes conversion. Do NOT flip.
             price_cents = int(round(price * 100))
+            # Kalshi supports fractional contracts (min 0.01); send the fractional
+            # size rounded to the 2-decimal granularity (NOT int() -> 0 for sub-1).
+            count = round(qty, 2)
             try:
                 resp = await asyncio.to_thread(self.api.create_order, ticker, side, "buy",
-                                               int(qty), price_cents, client_order_id = coid)
+                                               count, price_cents, client_order_id = coid)
             except Exception as e:                   # network error -> treat as reject
-                self._emit("reject", {"client_order_id": coid, "kind": "place", "err": str(e)})
+                self._emit("reject", {"client_order_id": coid, "kind": "place", "err": str(e),
+                                      "market_ticker": ticker, "side": side})
                 return
             now = time.time()
             if resp.status_code in (200, 201):
                 order_id = resp.json()["order_id"]   # V2 response is flat (no "order" wrapper)
-                self._orders[order_id] = _ProdRestingOrder(ticker, side, price, qty, coid)
+                self._orders[order_id] = _ProdRestingOrder(ticker, side, price, count, coid)
                 self._coid_to_handle[coid] = order_id
                 self._emit("ack", ack_msg(ticker, side, coid, order_id, "place", self._ms(now)))
                 self._reconcile(now, ticker, side)   # confirm RESTING / re-cancel if target moved
             else:                                    # 429 / hard 4xx -> order did not rest; free side
                 self._emit("reject", {"client_order_id": coid, "kind": "place",
-                                      "status": resp.status_code})
+                                      "status": resp.status_code,
+                                      "market_ticker": ticker, "side": side})
         except Exception as e:                       # never let a task die silently
             print(f"_do_place error: {type(e).__name__}: {e}")
 
@@ -453,7 +458,8 @@ class ProdExchange:
             try:
                 resp = await asyncio.to_thread(self.api.cancel_order, handle)
             except Exception as e:
-                self._emit("reject", {"client_order_id": coid, "kind": "cancel", "err": str(e)})
+                self._emit("reject", {"client_order_id": coid, "kind": "cancel", "err": str(e),
+                                      "market_ticker": ticker, "side": side})
                 return
             now = time.time()
             if resp.status_code in (200, 404):       # 404 == already gone (filled) -> cancelled
@@ -463,7 +469,8 @@ class ProdExchange:
                 self._reconcile(now, ticker, side)   # IDLE now -> place the (latest) target
             else:                                    # 429 / hard 4xx -> cancel failed, order still resting
                 self._emit("reject", {"client_order_id": coid, "kind": "cancel",
-                                      "status": resp.status_code})
+                                      "status": resp.status_code,
+                                      "market_ticker": ticker, "side": side})
         except Exception as e:
             print(f"_do_cancel error: {type(e).__name__}: {e}")
 
@@ -535,7 +542,12 @@ class ProdExchange:
                         "channels": ["orderbook_delta", "trade"], "market_tickers": self.tickers}}))
                     await ws.send(json.dumps({"id": 2, "cmd": "subscribe", "params": {
                         "channels": ["fill"]}}))
-                    print(f"ProdExchange subscribed: {len(self.tickers)} tickers + private fill")
+                    # market resolution/lifecycle: when a market we trade goes
+                    # determined/settled the strategy stops quoting it (firehose,
+                    # filtered client-side by mm_by_ticker in on_market_lifecycle).
+                    await ws.send(json.dumps({"id": 3, "cmd": "subscribe", "params": {
+                        "channels": ["market_lifecycle_v2"]}}))
+                    print(f"ProdExchange subscribed: {len(self.tickers)} tickers + private fill + lifecycle")
                     async for raw in ws:
                         self._dispatch(consumer, json.loads(raw), time.time())
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
@@ -654,5 +666,7 @@ class ProdExchange:
                     self._orders.pop(handle, None)
                     self._coid_to_handle.pop(o.coid, None)
             consumer._deliver("private_fill", msg)          # inventory/PnL only; no requote
+        elif mtype == "market_lifecycle_v2":                 # market resolved -> stop trading it
+            consumer.on_market_lifecycle(msg)
         elif mtype == "error":
             print(f"  WS error: {data}")

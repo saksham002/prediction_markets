@@ -82,7 +82,7 @@ def rest_headers(method: str, path: str, role: str = "read") -> dict:
             "KALSHI-ACCESS-TIMESTAMP": ts, "Content-Type": "application/json"}
 
 
-def create_order(ticker: str, side: str, action: str, count: int, price_cents: int,
+def create_order(ticker: str, side: str, action: str, count: float, price_cents: int,
                  *, client_order_id: str | None = None,
                  time_in_force: str = "good_till_canceled",
                  self_trade_prevention_type: str = "taker_at_cross",
@@ -92,7 +92,9 @@ def create_order(ticker: str, side: str, action: str, count: int, price_cents: i
     removed Jun 2026 (returns 410 deprecated_v1_order_endpoint). The original
     (side, action, price_cents) interface is KEPT and translated to V2's YES-leg
     bid/ask: side='yes'/'no' + action='buy'/'sell'; price_cents is the limit in
-    the SIDE's space (yes-cents for yes, no-cents for no). Returns the requests
+    the SIDE's space (yes-cents for yes, no-cents for no). `count` may be
+    fractional (Kalshi min 0.01 on fractional-enabled markets); it is sent as a
+    2-decimal fixed-point string. Returns the requests
     Response (.status_code 200/201 ok, 429 rate-limited, 4xx reject); .json() is
     FLAT (order_id, client_order_id, fill_count, remaining_count, ts_ms ...)."""
     # V2 expresses everything on the YES leg: bid=buy yes, ask=sell yes.

@@ -25,7 +25,7 @@ import websockets
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from src.utils.api import WS_URL, ws_auth_headers
-from research.hft.live_ipc import ORDERS_LOG, DECISIONS_LOG, PRIVATE_FEED_LOG
+from research.hft.live_ipc import ORDERS_LOG, ACKS_LOG, DECISIONS_LOG, PRIVATE_FEED_LOG
 
 
 def logger_main(out_dir: str, q):
@@ -34,8 +34,14 @@ def logger_main(out_dir: str, q):
     out = Path(out_dir)
     priv = gzip.open(out / PRIVATE_FEED_LOG, "wt")
     of = open(out / ORDERS_LOG, "w")
+    af = open(out / ACKS_LOG, "w")
     df = open(out / DECISIONS_LOG, "w")
     stop = threading.Event()
+    # record type -> destination file; unknown types fall back to decisions.
+    dest = {"order": of, "ack": af}
+
+    def flush_all():
+        of.flush(); af.flush(); df.flush()
 
     def drain():
         n = 0
@@ -43,15 +49,15 @@ def logger_main(out_dir: str, q):
             try:
                 rec = q.get(timeout = 1.0)
             except _queue.Empty:
-                of.flush(); df.flush()
+                flush_all()
                 continue
             if rec is None:                    # sentinel: trading finished
                 break
-            (of if rec.get("type") == "order" else df).write(json.dumps(rec) + "\n")
+            dest.get(rec.get("type"), df).write(json.dumps(rec) + "\n")
             n += 1
             if n % 50 == 0:
-                of.flush(); df.flush()
-        of.flush(); df.flush()
+                flush_all()
+        flush_all()
 
     drain_thread = threading.Thread(target = drain, daemon = True)
     drain_thread.start()
@@ -86,7 +92,7 @@ def logger_main(out_dir: str, q):
     finally:
         stop.set()
         drain_thread.join(timeout = 3)
-        for f in (priv, of, df):
+        for f in (priv, of, af, df):
             try:
                 f.flush(); f.close()
             except Exception:

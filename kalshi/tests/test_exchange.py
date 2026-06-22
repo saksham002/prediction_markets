@@ -263,3 +263,57 @@ def test_prod_place_is_nonblocking_then_acks_async():
         assert api.cancelled == ["H1"]
         assert router.state("M", "yes") == IDLE
     asyncio.run(scenario())
+
+
+def test_prod_place_sends_fractional_count_not_int_truncated():
+    """Sub-1 sizes are sent as fractional contracts (Kalshi min 0.01), NOT
+    int()-truncated to count=0 (the SCOMAR sub-1 dust-storm bug)."""
+    async def scenario():
+        api = _FakeApi()
+        view, prod, router = _setup_prod(api)
+        router.set_target(1.0, "M", "yes", (0.50, 0.99), {"event": "E"})
+        await asyncio.sleep(0.05)
+        assert len(api.created) == 1
+        count = api.created[0][3]              # (ticker, side, action, count, ...)
+        assert abs(count - 0.99) < 1e-9        # NOT int(0.99) == 0
+    asyncio.run(scenario())
+
+
+def test_dispatch_routes_market_lifecycle():
+    """A market_lifecycle_v2 WS message is routed to consumer.on_market_lifecycle
+    with the inner msg payload (event_type/market_ticker/...)."""
+    api = _FakeApi()
+    view, prod, router = _setup_prod(api)
+    seen = []
+    prod._consumer._timing = None
+    prod._consumer.on_market_lifecycle = lambda m: seen.append(m)
+    inner = {"event_type": "determined", "market_ticker": "M", "result": "yes"}
+    prod._dispatch(prod._consumer, {"type": "market_lifecycle_v2", "msg": inner}, 1.0)
+    assert seen == [inner]
+
+
+def test_lifecycle_determined_closes_market_and_cancels():
+    """determined/settled on a traded market closes EVERY leg of the owning
+    strategy (both sides cancelled, want=None); non-terminal / unknown events
+    are ignored."""
+    from types import SimpleNamespace
+    from research.hft.mm_sim import MMSimConsumer
+    calls = []
+    router = SimpleNamespace(set_target = lambda lts, t, s, want, ctx: calls.append((t, s, want)))
+    mm = SimpleNamespace(first_ticker = "E-A", second_ticker = "E-B",
+                         pair = {"event_ticker": "E"}, inventory = {"E-A": 5.0, "E-B": -2.0})
+    stub = SimpleNamespace(mm_by_ticker = {"E-A": mm, "E-B": mm}, closed_markets = set(),
+                           _cur_lts = 10.0, router = router)
+    MMSimConsumer.on_market_lifecycle(stub, {"event_type": "determined", "market_ticker": "E-A",
+                                             "result": "yes", "settlement_value": "1.0000"})
+    assert stub.closed_markets == {"E-A", "E-B"}
+    assert sorted(calls) == [("E-A", "no", None), ("E-A", "yes", None),
+                             ("E-B", "no", None), ("E-B", "yes", None)]
+    # non-terminal event (transient pause) -> ignored
+    stub2 = SimpleNamespace(mm_by_ticker = {"E-A": mm}, closed_markets = set(),
+                            _cur_lts = 0.0, router = SimpleNamespace(set_target = lambda *a: None))
+    MMSimConsumer.on_market_lifecycle(stub2, {"event_type": "deactivated", "market_ticker": "E-A"})
+    assert stub2.closed_markets == set()
+    # unknown ticker (firehose, not ours) -> ignored, no crash
+    MMSimConsumer.on_market_lifecycle(stub2, {"event_type": "determined", "market_ticker": "ZZZ"})
+    assert stub2.closed_markets == set()

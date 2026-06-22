@@ -67,8 +67,8 @@ class OrderRouter:
         self._applied_trades: set[str] = set()              # dedup private fills by trade_id
         # callback(ticker, side, qty, yes_price, action, reason, post) -> inventory/PnL
         self._on_reduce = on_reduce
-        # callback(ticker, side, action, price, qty, t_sent, t_done) AFTER a backend send
-        # -> consumer timing log. None in sim (zero overhead).
+        # callback(ticker, side, action, price, qty, t_sent, t_done, coid) AFTER a backend
+        # send -> consumer timing log. None in sim (zero overhead).
         self._on_order = on_order
         # callback(lts, event, ticker, side, action, price, size, alpha, qa, expo) ->
         # consumer.log_order (the offline order_rows log; a no-op in live timing mode).
@@ -192,7 +192,7 @@ class OrderRouter:
         # (sim); a no-op in prod where the ack arrives asynchronously.
         self.backend.drain(lts)
         if self._on_order:
-            self._on_order(ticker, side, "new", price, qty, t5, t6)
+            self._on_order(ticker, side, "new", price, qty, t5, t6, coid)
         return coid
 
     def cancel(self, lts: float, ticker: str, side: str) -> bool:
@@ -207,7 +207,7 @@ class OrderRouter:
         t6 = time.time() if self._on_order else 0.0
         self.backend.drain(lts)          # delay-0 cancel-ack -> IDLE this tick (sim)
         if self._on_order:
-            self._on_order(ticker, side, "cancel", info.get("price"), info.get("qty"), t5, t6)
+            self._on_order(ticker, side, "cancel", info.get("price"), info.get("qty"), t5, t6, coid)
         return True
 
     # ---- confirmations (from the consumer's feed handlers; STATE/ledger ONLY) ----
