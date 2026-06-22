@@ -34,8 +34,7 @@ from research.hft.filter_strategy import FilterStrategy
 from research.hft.forward_price import forward_fields
 from research.hft.replay import Replayer
 from research.hft.tick_study import StudyConsumer
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+from research.hft.paths import DATASET
 OUT = Path("/home/saksham3/projects/personal/prediction_markets/plots/alpha_return_corr_strat.csv")
 
 # Extended beyond the original [1,5,10,30,60,300]s (alpha HLs are extended in alphas.py).

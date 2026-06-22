@@ -11,9 +11,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from sweep_size_cap import COMBOS, RESULTS  # noqa: F401 (RESULTS dir reused)
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
-SIMS = Path("/data/user_data/saksham3/kalshi_hft/sims")
+try:
+    from research.hft.paths import DATASET, SIMS
+except ImportError:
+    from paths import DATASET, SIMS
 OUT = Path("/home/saksham3/projects/personal/prediction_markets/plots/bestviz")
 PY = sys.executable
 HFT = Path(__file__).parent

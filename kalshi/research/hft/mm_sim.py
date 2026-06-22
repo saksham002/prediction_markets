@@ -32,7 +32,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine
-from research.hft.strategy_config import StrategyConfig
+from research.hft.strategy_config import StrategyConfig, ensure_alphas
 from research.hft.passive_fill import FORWARD_DELAY_S, PassiveFillEngine
 from research.hft.order_router import OrderRouter
 from research.hft.exchange import SimExchange
@@ -42,7 +42,7 @@ from src.pnl import PnL
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_BASE = Path("/data/user_data/saksham3/kalshi_hft/sims")
+from research.hft.paths import SIMS as OUTPUT_BASE
 MARKOUT_HORIZONS_S = [5, 30, 60, 300]
 STATE_LOG_INTERVAL_S = 5.0
 
@@ -1261,6 +1261,7 @@ def main():
     out_dir.mkdir(parents = True, exist_ok = True)
 
     replayer = Replayer(args.recording)
+    ensure_alphas(args)              # -a/-t -> canonical alphas list (from_params requires it)
     consumer = MMSimConsumer(replayer, args)
     print(f"Replaying {args.recording}...")
     n = replayer.run(consumer)

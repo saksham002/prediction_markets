@@ -9,14 +9,18 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from lasso_pipeline import collect_samples, is_test
+try:
+    from research.hft.paths import DATASET, STUDIES
+except ImportError:
+    from paths import DATASET, STUDIES
 
 ALPHAS = ["tfma_pw_300s", "agg_300s", "obi"]
 PCTS = [50, 75, 90, 95]
-OUT = Path("/data/user_data/saksham3/kalshi_hft/studies/mlb_thresholds.json")
+OUT = STUDIES / "mlb_thresholds.json"
 
 
 def main():
-    names, by_event = collect_samples(Path("/data/user_data/saksham3/kalshi_hft/dataset"))
+    names, by_event = collect_samples(DATASET)
     col = {n: i for i, n in enumerate(names)}
     absvals = {a: [] for a in ALPHAS}
     n_games = 0

@@ -17,8 +17,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from game_times import game_start
+try:
+    from research.hft.paths import HFT_DATA
+except ImportError:
+    from paths import HFT_DATA
 
-DATA = Path("/data/user_data/saksham3/kalshi_hft")
+DATA = HFT_DATA
 DST = DATA / "dataset_games"
 MIN_CTS = 1_000_000
 PREGAME = 3600

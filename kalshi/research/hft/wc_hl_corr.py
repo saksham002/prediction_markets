@@ -7,13 +7,17 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from lasso_pipeline import collect_samples
+try:
+    from research.hft.paths import DATASET
+except ImportError:
+    from paths import DATASET
 
 HORIZON_S = 120
 HLS = ["tfma_pw_1s", "tfma_pw_5s", "tfma_pw_10s", "tfma_pw_30s", "tfma_pw_60s", "tfma_pw_300s"]
 
 
 def main():
-    names, by_event = collect_samples(Path("/data/user_data/saksham3/kalshi_hft/dataset"))
+    names, by_event = collect_samples(DATASET)
     col = {n: i for i, n in enumerate(names)}
     Xs, ys = [], []
     for event, g in by_event.items():

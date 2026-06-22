@@ -53,9 +53,8 @@ def main():
         for threshold in THRESHOLDS:
             combo = {"weights": w_map, "means": means, "stds": stds}
             league_cfg = {
-                "alpha_name": "combo",
+                "alphas": [{"name": "combo", "threshold": threshold}],
                 "combo": combo,
-                "skew_threshold": threshold,
                 "per_order_size": args.size,
                 "inventory_cap": args.cap,
                 "pair_risk": True,

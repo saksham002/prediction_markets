@@ -5,10 +5,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.espn_clock import clocks_for
+from research.hft.paths import SIMS
 
 ev = "KXWCGAME-26JUN11MEXRSA"
 c = clocks_for(ev)
-rd = Path("/data/user_data/saksham3/kalshi_hft/sims/wctest_mexrsa")
+rd = SIMS / "wctest_mexrsa"
 orders = list(csv.DictReader(open(rd / "orders.csv")))
 fmt = lambda t: datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S")
 ko5, liq, ft = c["ko"] + 300, c["sh"] + 2400, c["ft"]

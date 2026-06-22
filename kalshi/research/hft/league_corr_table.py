@@ -22,8 +22,7 @@ from scipy.stats import pearsonr
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.lasso_pipeline import collect_samples
 from research.hft.tick_study import HORIZONS_S
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+from research.hft.paths import DATASET
 OUT = Path("/home/saksham3/projects/personal/prediction_markets/plots/alpha_return_corr.csv")
 MIN_N = 30
 

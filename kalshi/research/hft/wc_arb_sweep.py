@@ -19,8 +19,7 @@ from arb_sim import run_one
 from research.hft.replay import Replayer
 from research.hft.espn_clock import clocks_for
 from research.hft.passive_fill import FORWARD_DELAY_S
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+from research.hft.paths import DATASET
 OUT = Path("/home/saksham3/projects/personal/prediction_markets/plots/arb_pnl_sweep.csv")
 TS = [2, 4, 6, 8, 10]
 LS = [3, 4, 5, 6, 7]

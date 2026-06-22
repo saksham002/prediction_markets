@@ -39,8 +39,8 @@ def main():
     args = parser.parse_args()
 
     params = SimpleNamespace(
-        per_order_size = 500, inventory_cap = 1000, skew_threshold = 0.0,
-        alpha_name = args.alpha, max_spread = 0.02, price_min = 0.05, price_max = 0.95,
+        per_order_size = 500, inventory_cap = 1000,
+        alphas = [{"name": args.alpha, "threshold": 0.0}], max_spread = 0.02, price_min = 0.05, price_max = 0.95,
         improve = False, pair_risk = True, combo = None, series = None,
         forward_delay = FORWARD_DELAY_S, size_ref = None, max_queue_ahead = None,
         per_leg_alpha = False,

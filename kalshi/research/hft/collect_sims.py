@@ -6,7 +6,12 @@ into one table, print sorted by net_pnl, and write combined CSV.
 import csv
 from pathlib import Path
 
-SIMS_DIR = Path("/data/user_data/saksham3/kalshi_hft/sims")
+try:
+    from research.hft.paths import SIMS
+except ImportError:
+    from paths import SIMS
+
+SIMS_DIR = SIMS
 
 
 def main():

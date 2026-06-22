@@ -25,9 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from eval_buffer import run_one
 from exchange import REALISTIC_DELAYS
 
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
-SIMS = Path("/data/user_data/saksham3/kalshi_hft/sims")
-STUDIES = Path("/data/user_data/saksham3/kalshi_hft/studies")
+from paths import DATASET, SIMS, STUDIES
 
 # ---- default study: obi_dev vs obi_dev AND agg_dev ----
 N_TRAIN = 21                                  # 21 in-sample / 6 out-sample (27-game set)

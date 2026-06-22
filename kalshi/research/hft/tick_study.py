@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine
 from research.hft.replay import Replayer
 
-OUTPUT_BASE = Path("/data/user_data/saksham3/kalshi_hft/studies")
+from research.hft.paths import STUDIES as OUTPUT_BASE
 HORIZONS_S = [1, 5, 10, 30, 60, 300]
 
 

@@ -25,8 +25,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.lasso_pipeline import collect_samples
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+from research.hft.paths import DATASET
 OUT_CSV = Path("/home/saksham3/projects/personal/prediction_markets/plots/lead_lag_60s.csv")
 OUT_PNG = Path("/home/saksham3/projects/personal/prediction_markets/plots/lead_lag_60s.png")
 

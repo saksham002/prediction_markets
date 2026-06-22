@@ -26,7 +26,7 @@ from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine
 from research.hft.replay import Replayer
 from src.pnl import PnL
 
-OUTPUT_BASE = Path("/data/user_data/saksham3/kalshi_hft/sims")
+from research.hft.paths import SIMS as OUTPUT_BASE
 MARKOUT_HORIZONS_S = [5, 30, 60, 300]
 
 

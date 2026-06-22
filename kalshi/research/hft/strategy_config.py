@@ -123,9 +123,6 @@ class StrategyConfig:
     pub_delay: float = 0.0
     fill_delay: float = 0.0
     fill_pub_lag: float = 0.0
-    # True iff built from an explicit `alphas` list (vs legacy alpha_name); gates
-    # the lazy-HL engine path so legacy/canary configs keep the full default sets.
-    from_alphas_list: bool = False
 
     @property
     def alpha_name(self) -> str:
@@ -145,13 +142,9 @@ class StrategyConfig:
 
     def half_lives(self) -> dict[str, dict[str, float]] | None:
         """Per-component {label: seconds} buckets the engine should maintain, or
-        None to use the module defaults. Lazy buckets are returned ONLY when built
-        from an explicit alphas list AND every gate is a recognized HL family — so
-        transitive deps of agree/combo/etc. (which need other components) are never
-        silently dropped, and legacy/canary configs stay bit-identical on the full
-        default sets."""
-        if not self.from_alphas_list:
-            return None
+        None to use the module defaults. None is returned when ANY gate is a non-HL
+        / unrecognized family (agree/combo/obi) — those need the full default
+        component sets (transitive deps), so we never silently drop them."""
         buckets: dict[str, dict[str, float]] = {}
         for g in self.alphas:
             fam, label = parse_alpha_name(g.name)
@@ -166,18 +159,15 @@ class StrategyConfig:
 
     @classmethod
     def from_params(cls, params) -> "StrategyConfig":
-        """Bridge a SimpleNamespace / argparse.Namespace into a StrategyConfig.
-        New `alphas` list wins; else fall back to a single legacy gate built from
-        alpha_name + skew_threshold (so existing configs + the canary are unchanged)."""
+        """Bridge a SimpleNamespace / argparse.Namespace into a StrategyConfig. The
+        strategy spec is the `alphas` list (each {name|family, hl, threshold}); CLI
+        entry points synthesize it from -a/-t via ensure_alphas() before calling this."""
         g = lambda k, d = None: getattr(params, k, d)
         spec = g("alphas", None)
-        if spec:
-            gates = tuple(AlphaGate.from_spec(s) for s in spec)
-            from_list = True
-        else:
-            gates = (AlphaGate.from_spec(
-                {"name": g("alpha_name", "agree_om"), "threshold": g("skew_threshold", 0.0)}),)
-            from_list = False
+        if not spec:
+            raise ValueError("StrategyConfig.from_params needs an 'alphas' list "
+                             "(CLI entry points call ensure_alphas(params) to build it from -a/-t)")
+        gates = tuple(AlphaGate.from_spec(s) for s in spec)
         return cls(
             alphas = gates,
             per_order_size = g("per_order_size", 1000),
@@ -206,5 +196,15 @@ class StrategyConfig:
             pub_delay = g("pub_delay", 0.0),
             fill_delay = g("fill_delay", 0.0),
             fill_pub_lag = g("fill_pub_lag", 0.0),
-            from_alphas_list = from_list,
         )
+
+
+def ensure_alphas(params):
+    """CLI convenience for single-alpha entry points: if `params` has no `alphas`
+    list, synthesize a one-gate list from the -a/-t args (alpha_name/skew_threshold).
+    from_params REQUIRES `alphas`; this is the only place the -a/-t shorthand is
+    bridged into the canonical list form."""
+    if not getattr(params, "alphas", None):
+        params.alphas = [{"name": getattr(params, "alpha_name", "agree_om"),
+                          "threshold": getattr(params, "skew_threshold", 0.0)}]
+    return params

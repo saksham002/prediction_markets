@@ -25,7 +25,8 @@ from research.hft.alphas import SingleAlphaEngine
 from research.hft.strategy_config import StrategyConfig
 from research.hft.replay import Replayer
 
-CACHE_DIR = Path("/data/user_data/saksham3/kalshi_hft/studies/threshold_cache")
+from research.hft.paths import STUDIES
+CACHE_DIR = STUDIES / "threshold_cache"
 
 
 def _stems(games):

@@ -6,9 +6,9 @@ league, as required.
 Config JSON maps series ticker -> mm_sim-style params:
 
   {
-    "KXMLBGAME":  {"alpha_name": "agree_om", "per_order_size": 1000,
-                   "inventory_cap": 3000, "skew_threshold": 0, "pair_risk": true},
-    "KXNBAGAME":  {"alpha_name": "agree_om", "per_order_size": 500, ...}
+    "KXMLBGAME":  {"alphas": [{"name": "agree_om", "threshold": 0}], "per_order_size": 1000,
+                   "inventory_cap": 3000, "pair_risk": true},
+    "KXNBAGAME":  {"alphas": [{"name": "agree_om", "threshold": 0}], "per_order_size": 500, ...}
   }
 
 Every recording in --ticks-dir is replayed once per configured league (the
@@ -29,15 +29,14 @@ from research.hft.mm_sim import MMSimConsumer, compute_markouts, MARKOUT_HORIZON
 from research.hft.replay import Replayer
 from research.hft.passive_fill import FORWARD_DELAY_S
 
-TICKS_DIR = Path("/data/user_data/saksham3/kalshi_hft/ticks")
+from research.hft.paths import TICKS as TICKS_DIR
 PARAM_DEFAULTS = {
     "per_order_size": 1000,
     "inventory_cap": 3000,
-    "skew_threshold": 0.0,
-    "alpha_name": "agree_om",
-    # new symmetric multi-alpha gate spec (list of {name|family, hl, threshold}); when
-    # present it supersedes alpha_name/skew_threshold (StrategyConfig.from_params).
-    "alphas": None,
+    # symmetric multi-alpha gate spec: list of {name|family, hl, threshold}. A side is
+    # blocked if ANY gate crosses its threshold. Default = single agree_om gate; a cfg
+    # overrides with its own list (StrategyConfig.from_params requires `alphas`).
+    "alphas": ({"name": "agree_om", "threshold": 0.0},),
     "max_spread": 0.01,
     "price_min": 0.05,
     "price_max": 0.95,

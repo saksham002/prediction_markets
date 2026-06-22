@@ -21,9 +21,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.lasso_pipeline import collect_samples, is_test, is_val, HORIZON_S
 from research.hft.alphas import PairAlphaEngine
+from research.hft.paths import DATASET, STUDIES
 
 RIDGE = 1e-2
-COMBO_PATH = "/data/user_data/saksham3/kalshi_hft/studies/lasso_combo.json"
+COMBO_PATH = str(STUDIES / "lasso_combo.json")
 
 
 def ridge_fit(Z, y, lam = RIDGE):
@@ -37,7 +38,7 @@ def main():
     means = np.array([combo["means"][f] for f in features])
     stds = np.array([combo["stds"][f] for f in features])
 
-    names, by_event = collect_samples(Path("/data/user_data/saksham3/kalshi_hft/dataset"))
+    names, by_event = collect_samples(DATASET)
     col = {n: i for i, n in enumerate(names)}
     fidx = [col[f] for f in features]
 
@@ -133,7 +134,7 @@ def main():
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    out_dir = Path("/data/user_data/saksham3/kalshi_hft/studies/per_game_weights")
+    out_dir = STUDIES / "per_game_weights"
     out_dir.mkdir(parents = True, exist_ok = True)
     with open(out_dir / "weights.csv", "w", newline = "") as f:
         wcsv = csvmod.writer(f)

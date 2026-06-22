@@ -12,9 +12,9 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.alphas import SingleAlphaEngine
 from research.hft.replay import Replayer
+from research.hft.paths import DATASET, STUDIES
 
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
-OUT = Path("/data/user_data/saksham3/kalshi_hft/studies/wc_thresholds.json")
+OUT = STUDIES / "wc_thresholds.json"
 ALPHAS = ["obi", "agg_ratio_300s", "tfma_pw_ratio_300s",
           "obi_dev_5s", "obi_dev_60s", "obi_dev_300s"]
 PCTS = [50, 75, 90, 95, 99]

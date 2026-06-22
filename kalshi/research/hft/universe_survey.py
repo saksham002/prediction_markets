@@ -14,10 +14,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.signals.pairs import build_pair_metadata
+from research.hft.paths import HFT_DATA
 from src.utils.api import fetch_series_fee, paginate
 from src.utils.timestamp import Timestamp
 
-OUTPUT_DIR = Path("/data/user_data/saksham3/kalshi_hft/universe")
+OUTPUT_DIR = HFT_DATA / "universe"
 
 
 def leg_quotes(market: dict):

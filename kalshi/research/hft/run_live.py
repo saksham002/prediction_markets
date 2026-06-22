@@ -33,7 +33,8 @@ def build_args():
     p.add_argument("--live", action = "store_true", help = "REAL orders (default: paper)")
     p.add_argument("--paper", action = "store_true", help = "explicit paper (no real orders)")
     p.add_argument("--config", type = str, default = None,
-                   help = "best-config json (keys: alpha, thr, size, cap)")
+                   help = "strategy json; must contain an 'alphas' list (+ per_order_size, "
+                          "inventory_cap, free_budget, ...) — reproduces a sweep config exactly")
     p.add_argument("-a", "--alpha-name", type = str, default = "obi_dev_60s")
     p.add_argument("-t", "--skew-threshold", type = float, default = 0.176139)
     p.add_argument("-s", "--per-order-size", type = float, default = 50)
@@ -64,13 +65,14 @@ def build_args():
 
     if args.config:
         c = json.load(open(args.config))
-        # Apply EVERY knob in the config onto args (the config is the full strategy
-        # spec so live reproduces the sweep exactly). 4 short aliases for back-compat
-        # with the sweep's auto-output; all other keys map 1:1 to arg names.
-        alias = {"alpha": "alpha_name", "thr": "skew_threshold",
-                 "size": "per_order_size", "cap": "inventory_cap"}
+        # the config is the full strategy spec; apply every knob 1:1 onto args so live
+        # reproduces the sweep exactly. It MUST carry an `alphas` list -> fail loudly
+        # rather than silently fall back to the -t default threshold.
         for k, v in c.items():
-            setattr(args, alias.get(k, k), v)
+            setattr(args, k, v)
+        if not getattr(args, "alphas", None):
+            sys.exit(f"--config {args.config}: no 'alphas' list. Legacy alpha/thr configs are "
+                     "no longer supported; use {'alphas': [{'family','hl','threshold'}], ...}")
     args.combo = None
     if args.combo_file:
         args.combo = json.load(open(args.combo_file))

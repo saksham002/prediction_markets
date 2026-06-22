@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.alphas import PairAlphaEngine
 from research.hft.replay import Replayer
 from research.hft.tick_study import StudyConsumer
+from research.hft.paths import DATASET, STUDIES
 
 HORIZON_S = 180
 # One family per signal CONCEPT: raw and price-weighted TFMA are
@@ -111,8 +112,8 @@ def lasso_cd(Z, y, lam, n_iter = 200):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ticks-dir", default = "/data/user_data/saksham3/kalshi_hft/dataset")
-    parser.add_argument("--out", default = "/data/user_data/saksham3/kalshi_hft/studies/lasso_combo.json")
+    parser.add_argument("--ticks-dir", default = str(DATASET))
+    parser.add_argument("--out", default = str(STUDIES / "lasso_combo.json"))
     args = parser.parse_args()
 
     names, by_event = collect_samples(Path(args.ticks_dir))

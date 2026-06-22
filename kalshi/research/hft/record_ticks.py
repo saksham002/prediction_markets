@@ -37,7 +37,7 @@ from research.hft.game_times import game_start
 from src.utils.api import WS_URL, fetch_series_fee, paginate, ws_auth_headers
 from src.utils.timestamp import Timestamp
 
-DATA_ROOT = Path("/data/user_data/saksham3/kalshi_hft")
+from research.hft.paths import HFT_DATA as DATA_ROOT
 STAGING_DIR = DATA_ROOT / "games_recording"   # in-progress per-game files
 DATASET_DIR = DATA_ROOT / "dataset"           # finalized games (>=1M any leg)
 SUB_DIR = DATA_ROOT / "sub_1M"                 # sub-threshold games (preserved)

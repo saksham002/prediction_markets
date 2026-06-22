@@ -14,6 +14,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from lasso_pipeline import collect_samples, lasso_cd
 from tick_study import StudyConsumer  # noqa: F401 (imported via lasso_pipeline)
+try:
+    from research.hft.paths import DATASET, STUDIES
+except ImportError:
+    from paths import DATASET, STUDIES
 
 HORIZON_S = 180
 FEATURES = ["tfma_pw_300s", "obi_ma_1s", "mom_30s", "obi"]
@@ -67,8 +71,8 @@ def fit_pool(X, y, label):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ticks-dir", default = "/data/user_data/saksham3/kalshi_hft/dataset")
-    parser.add_argument("--out-dir", default = "/data/user_data/saksham3/kalshi_hft/studies")
+    parser.add_argument("--ticks-dir", default = str(DATASET))
+    parser.add_argument("--out-dir", default = str(STUDIES))
     args = parser.parse_args()
 
     names, by_event = collect_samples(Path(args.ticks_dir))

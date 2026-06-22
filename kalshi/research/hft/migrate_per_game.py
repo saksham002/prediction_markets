@@ -13,8 +13,13 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-SRC = Path("/data/user_data/saksham3/kalshi_hft/dataset")
-DST = Path("/data/user_data/saksham3/kalshi_hft/dataset_games")
+try:
+    from research.hft.paths import DATASET, HFT_DATA
+except ImportError:
+    from paths import DATASET, HFT_DATA
+
+SRC = DATASET
+DST = HFT_DATA / "dataset_games"
 MIN_CTS = 1_000_000
 
 

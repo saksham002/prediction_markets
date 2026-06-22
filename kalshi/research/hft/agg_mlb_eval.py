@@ -15,8 +15,10 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent))
 from eval_buffer import run_one
 from lasso_pipeline import collect_samples, is_test
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+try:
+    from research.hft.paths import DATASET
+except ImportError:
+    from paths import DATASET
 HORIZONS = (120.0, 180.0)
 HLS = ["1s", "5s", "10s", "30s", "60s", "300s"]
 PCTS = [50, 75, 90, 95]
@@ -89,7 +91,7 @@ def main():
         for thr in thresholds:
             agg_row = {"train_realized_net": 0.0, "test_realized_net": 0.0,
                        "train_net": 0.0, "test_net": 0.0, "n_fills": 0, "fees": 0.0}
-            cfg = {"alpha_name": alpha, "skew_threshold": thr,
+            cfg = {"alphas": [{"name": alpha, "threshold": thr}],
                    "per_order_size": 500, "inventory_cap": 1000, "budget": 1000}
             for rec in recordings:
                 row = run_one(rec, "KXMLBGAME", cfg)

@@ -12,8 +12,11 @@ import sys
 import urllib.request
 from pathlib import Path
 
-CACHE = Path("/data/user_data/saksham3/kalshi_hft/studies/wc_clocks.json")
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+try:
+    from research.hft.paths import STUDIES, DATASET
+except ImportError:                         # run standalone: research/hft is sys.path[0]
+    from paths import STUDIES, DATASET
+CACHE = STUDIES / "wc_clocks.json"
 SB = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard?dates={d}"
 SUM = "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/summary?event={e}"
 MONTHS = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,

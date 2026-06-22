@@ -7,8 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from book_player import build_player
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+try:
+    from research.hft.paths import DATASET
+except ImportError:
+    from paths import DATASET
 OUT = Path("/home/saksham3/projects/personal/prediction_markets/plots/players")
 
 

@@ -16,8 +16,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 from alphas import PairAlphaEngine
 from replay import Replayer
 from tick_study import StudyConsumer
-
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
+try:
+    from research.hft.paths import DATASET
+except ImportError:
+    from paths import DATASET
 
 
 def _ts(iso):

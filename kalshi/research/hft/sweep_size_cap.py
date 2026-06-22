@@ -14,10 +14,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from eval_buffer import run_one
+try:
+    from research.hft.paths import DATASET, SIMS, STUDIES
+except ImportError:
+    from paths import DATASET, SIMS, STUDIES
 
-DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
-RESULTS = Path("/data/user_data/saksham3/kalshi_hft/sims/size_cap_sweep")
-THR_JSON = Path("/data/user_data/saksham3/kalshi_hft/studies/mlb_thresholds.json")
+RESULTS = SIMS / "size_cap_sweep"
+THR_JSON = STUDIES / "mlb_thresholds.json"
 
 # Train-MLB |alpha| percentiles, recomputed per dataset by compute_thresholds.py.
 # Fall back to the Jun-12 hardcoded values only if the json is absent.
@@ -56,7 +59,7 @@ def run_shard(shard: int, num_shards: int):
         out = RESULTS / _combo_key(alpha, thr, s, cap, sq)
         if out.exists():
             continue
-        cfg = {"alpha_name": alpha, "skew_threshold": thr, "per_order_size": s,
+        cfg = {"alphas": [{"name": alpha, "threshold": thr}], "per_order_size": s,
                "inventory_cap": cap, "budget": 1000, "square_off": sq}
         agg = {"alpha": alpha, "thr": thr, "size": s, "cap": cap, "square_off": sq,
                "train_realized_net": 0.0, "test_realized_net": 0.0,

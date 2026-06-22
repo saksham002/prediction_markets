@@ -26,6 +26,7 @@ import websockets
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.mm_sim import MMSimConsumer, compute_markouts, MARKOUT_HORIZONS_S, OUTPUT_BASE
+from research.hft.strategy_config import ensure_alphas
 from research.hft.passive_fill import FORWARD_DELAY_S
 from research.hft.record_ticks import discover_extra_events
 from research.hft.market_view import MarketView, TopOfBook  # noqa: F401
@@ -254,6 +255,7 @@ async def build_and_run(args, pairs, extra_events, out_dir, write_at_end = True)
     The launcher passes write_at_end=False (the separate logger persists everything;
     main does no file I/O)."""
     args.live_clock = True            # live-data run: WCStrategy reads consumer.live_clocks
+    ensure_alphas(args)               # config alphas (or -a/-t fallback) -> canonical list
     feed = LiveFeed(args.tickers)
     consumer = MMSimConsumer(feed, args)
     consumer.live_clocks = {}         # event_ticker -> ESPN clock (live game-phase gating)
