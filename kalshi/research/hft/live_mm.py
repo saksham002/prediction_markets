@@ -185,17 +185,45 @@ def write_outputs(consumer, args, out_dir: Path):
     print("=" * 64)
 
 
+def load_universe(path: str):
+    """Explicit tradeable universe from a JSON file — bypasses discover_league_events
+    + the liquidity/window gate. Shape mirrors discovery output:
+        {"pairs":  [{"event_ticker", "first_ticker", "second_ticker"}, ...],
+         "events": [{"event_ticker", "tickers": [...]}, ...]}
+    'series' is derived from each event's first ticker prefix (pairs get theirs in
+    resolve_universe). Returns (pairs, extra_events)."""
+    with open(path) as f:
+        u = json.load(f)
+    pairs = u.get("pairs", [])
+    extra_events = u.get("events", [])
+    for ev in extra_events:
+        ev.setdefault("series", ev["tickers"][0].split("-", 1)[0])
+    return pairs, extra_events
+
+
 def resolve_universe(args):
-    """Discover + fee-annotate + liquidity/window-gate the trading universe; sets
-    args.tickers / args.game_starts. Returns (pairs, extra_events, tickers). Shared
-    by live_mm.main and run_live.py (the launcher) so discovery happens once."""
-    from research.hft.discovery import discover_league_events
+    """Resolve + fee-annotate the trading universe; sets args.tickers / args.game_starts.
+    Returns (pairs, extra_events, tickers). The SOURCE is either an explicit
+    --universe JSON file (discovery + gate bypassed) or auto-discovery + the
+    liquidity/window gate. Shared by live_mm.main and run_live.py (the launcher)."""
     from research.hft.game_times import game_start
-    from research.hft.record_ticks import liquidity_window_gate
-    all_series = ",".join(filter(None, [args.series, args.extra_series]))
-    pairs, extra_events = discover_league_events(all_series, args.top_n)
-    if not pairs and not extra_events:
-        return [], [], []
+    if getattr(args, "universe", None):
+        pairs, extra_events = load_universe(args.universe)
+        args.series = None          # explicit universe is authoritative -> on_meta must not series-filter it
+        print(f"explicit universe ({args.universe}): {len(pairs)} pairs, {len(extra_events)} events")
+    else:
+        from research.hft.discovery import discover_league_events
+        from research.hft.record_ticks import liquidity_window_gate
+        all_series = ",".join(filter(None, [args.series, args.extra_series]))
+        pairs, extra_events = discover_league_events(all_series, args.top_n)
+        if not pairs and not extra_events:
+            return [], [], []
+        now = time.time()
+        lookahead = (args.duration or 12) * 3600
+        pairs = liquidity_window_gate(pairs, lambda p: p["first_ticker"], now, args.min_volume, lookahead)
+        extra_events = liquidity_window_gate(extra_events, lambda e: e["tickers"][0], now, args.min_volume, lookahead)
+        print(f"after liquidity/window gate: {len(pairs)} pairs, {len(extra_events)} events")
+    # fee annotation (series-derived; shared by both sources)
     fee_cache = {}
     for pair in pairs:
         series = pair["first_ticker"].split("-", 1)[0]
@@ -207,16 +235,11 @@ def resolve_universe(args):
         if ev["series"] not in fee_cache:
             fee_cache[ev["series"]] = fetch_series_fee(ev["series"])
         ev["fee_multiplier"], ev["fee_type"] = fee_cache[ev["series"]]
-    now = time.time()
-    lookahead = (args.duration or 12) * 3600
-    pairs = liquidity_window_gate(pairs, lambda p: p["first_ticker"], now, args.min_volume, lookahead)
-    extra_events = liquidity_window_gate(extra_events, lambda e: e["tickers"][0], now, args.min_volume, lookahead)
     args.game_starts = {}
     for pair in pairs:
         args.game_starts[pair["event_ticker"]] = game_start(pair["event_ticker"], pair["first_ticker"])
     for ev in extra_events:
         args.game_starts[ev["event_ticker"]] = game_start(ev["event_ticker"], ev["tickers"][0])
-    print(f"after liquidity/window gate: {len(pairs)} pairs, {len(extra_events)} events")
     tickers = []
     for pair in pairs:
         tickers.extend([pair["first_ticker"], pair["second_ticker"]])
@@ -285,6 +308,9 @@ async def main():
     parser = argparse.ArgumentParser(description = "Live paper-trading passive MM (no real orders)")
     parser.add_argument("-n", "--top-n", type = int, default = 10)
     parser.add_argument("-c", "--category", type = str, default = "Sports")
+    parser.add_argument("--universe", type = str, default = None,
+                        help = "JSON file of explicit pairs/events to trade "
+                               "(bypasses discovery + the liquidity/window gate)")
     parser.add_argument("--series", type = str, default = None,
                         help = "Comma-separated series filter (e.g. KXMLBGAME,KXNBAGAME)")
     parser.add_argument("--extra-series", type = str, default = None,

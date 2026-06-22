@@ -39,6 +39,8 @@ def build_args():
     p.add_argument("-s", "--per-order-size", type = float, default = 50)
     p.add_argument("-i", "--inventory-cap", type = float, default = 1000)
     p.add_argument("--budget", type = float, default = 250)
+    p.add_argument("--universe", type = str, default = None,
+                   help = "JSON file of explicit pairs/events to trade (bypasses discovery + gate)")
     p.add_argument("--series", type = str, default = "KXWCGAME")
     p.add_argument("--extra-series", type = str, default = None)
     p.add_argument("-n", "--top-n", type = int, default = 10)

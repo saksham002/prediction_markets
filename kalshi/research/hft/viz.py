@@ -103,17 +103,20 @@ def plot_event(event: str, srows: list[dict], frows: list[dict], out_path: Path,
     mid = np.array([fnum(r["mid"]) for r in srows])
     alpha = np.array([fnum(r["alpha"]) for r in srows])
     expo = np.array([fnum(r["exposure"]) for r in srows])
-    realized = np.array([fnum(r["realized_total"]) for r in srows])
-    fees = np.array([fnum(r["fees_total"]) for r in srows])
+    # global (whole-game) cumulative PnL — overlaid in every leg's PnL panel
+    realized_g = np.array([fnum(r["realized_total"]) for r in srows])
+    fees_g = np.array([fnum(r["fees_total"]) for r in srows])
 
     fig, axes = plt.subplots(4, 1, figsize = (12, 11), sharex = True)
     fig.suptitle(event, fontsize = 13)
 
-    # Per-event PnL when the run logged it (newer runs); else global PnL
+    # Per-leg (this event's tickers) PnL when the run logged it (newer runs); else global
     has_event_pnl = "realized_event" in srows[0]
     if has_event_pnl:
         realized = np.array([fnum(r["realized_event"]) for r in srows])
         fees = np.array([fnum(r["fees_event"]) for r in srows])
+    else:
+        realized, fees = realized_g, fees_g
 
     ax = axes[0]
     ax.plot(t, mid, lw = 0.8, color = "black", label = "mid")
@@ -141,10 +144,15 @@ def plot_event(event: str, srows: list[dict], frows: list[dict], out_path: Path,
     axes[2].axhline(0, color = "gray", lw = 0.5)
     axes[2].set_ylabel("exposure (cts)")
 
-    scope = "event" if has_event_pnl else "global"
+    scope = "leg" if has_event_pnl else "game"
     axes[3].plot(t, realized, lw = 1.0, color = "green", label = f"realized ({scope})")
     axes[3].plot(t, fees, lw = 1.0, color = "red", label = f"fees ({scope})")
-    axes[3].plot(t, realized - fees, lw = 1.2, color = "black", label = "realized-fees")
+    axes[3].plot(t, realized - fees, lw = 1.4, color = "black", label = f"net ({scope})")
+    if has_event_pnl:
+        # overall whole-game net, overlaid so each leg shows the total too
+        axes[3].plot(t, realized_g - fees_g, lw = 1.2, color = "darkblue", ls = "--",
+                     label = "net (game total)")
+    axes[3].axhline(0, color = "gray", lw = 0.5)
     axes[3].set_ylabel("PnL $")
     axes[3].set_xlabel(xlabel)
     axes[3].legend(loc = "upper left", fontsize = 8)
