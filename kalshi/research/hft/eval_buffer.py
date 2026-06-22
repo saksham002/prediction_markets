@@ -35,6 +35,9 @@ PARAM_DEFAULTS = {
     "inventory_cap": 3000,
     "skew_threshold": 0.0,
     "alpha_name": "agree_om",
+    # new symmetric multi-alpha gate spec (list of {name|family, hl, threshold}); when
+    # present it supersedes alpha_name/skew_threshold (StrategyConfig.from_params).
+    "alphas": None,
     "max_spread": 0.01,
     "price_min": 0.05,
     "price_max": 0.95,
@@ -55,6 +58,7 @@ PARAM_DEFAULTS = {
     "fill_pub_lag": 0.0,
     "budget": 1000,
     "free_budget": False,
+    "losing_leg_bias": 0.0,
     "aggro_entry": None,
     "aggro_limit": 300,
     "aggro_profit": 0.02,
@@ -111,6 +115,9 @@ def run_one(recording: Path, series: str, cfg: dict) -> dict | None:
         "n_pairs": len(consumer.strategies),
         "n_fills": len(consumer.fill_rows),
         "contracts": round(sum(r["qty"] for r in consumer.fill_rows), 1),
+        # gross dollar volume traded = sum(execution price in the side's own space * qty)
+        # over every fill; PnL/volume (in bps) = edge captured per dollar transacted.
+        "volume": round(sum(r["price"] * r["qty"] for r in consumer.fill_rows), 2),
         "realized_pnl": round(pnl.realized_pnl, 4),
         "fees_paid": round(pnl.fees_paid, 4),
         "net_pnl": round(pnl.net_total_pnl(prices = last_mids), 4),

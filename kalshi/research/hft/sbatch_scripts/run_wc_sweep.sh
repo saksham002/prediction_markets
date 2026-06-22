@@ -6,16 +6,22 @@
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
-#SBATCH --partition=general
-#SBATCH --array=1-8
+#SBATCH --partition=preempt
+#SBATCH --requeue
+#SBATCH --array=1-24
 
-# REALISTIC WC FootballStrategy sweep -> sims/wc_sweep_r<budget>/: prod-faithful
-# execution (SimExchange AWS feed delays + in-flight lock + 20ms forward fill
-# latency; ungated requote = decide-from-view every event). obi-only 252 combos,
-# 12/8 chronological, token rate limiter (place 10 / cancel 2 / 100-per-sec) ->
-# sims/wc_sweep_r<budget>_obi_tok/. Budget is arg $1. 8 shards (auto-skips written).
-BUDGET=${1:-1000}
+# Generic WC sweep (default study + all params fixed in wc_sweep.py). 24-shard
+# PREEMPT array; --requeue + the per-config skip make each shard resumable after a
+# preemption. Two submit steps (the finalize reads the stored per-game PnLs and
+# writes best-in/best-out -- it re-runs NO sims):
+#   AID=$(sbatch --parsable sbatch_scripts/run_wc_sweep.sh)
+#   sbatch --array=1 --dependency=afterany:$AID sbatch_scripts/run_wc_sweep.sh finalize
+MODE=${1:-shard}
 PY=/data/user_data/saksham3/uv/kalshi/.venv/bin/python
 HFT=/home/saksham3/projects/personal/prediction_markets/kalshi/research/hft
-SHARD=$((SLURM_ARRAY_TASK_ID - 1))
-$PY -u $HFT/wc_sweep.py --shard $SHARD --num-shards 8 --budget $BUDGET
+if [ "$MODE" = "finalize" ]; then
+    $PY -u $HFT/wc_sweep.py --finalize
+else
+    SHARD=$((SLURM_ARRAY_TASK_ID - 1))
+    $PY -u $HFT/wc_sweep.py --shard $SHARD --num-shards 24
+fi

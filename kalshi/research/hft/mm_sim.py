@@ -32,6 +32,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from research.hft.alphas import PairAlphaEngine, SingleAlphaEngine
+from research.hft.strategy_config import StrategyConfig
 from research.hft.passive_fill import FORWARD_DELAY_S, PassiveFillEngine
 from research.hft.order_router import OrderRouter
 from research.hft.exchange import SimExchange
@@ -92,12 +93,15 @@ class PairMM:
         self.pair = pair
         self.consumer = consumer
         self.params = params
+        self.cfg = consumer.cfg
         self.first_ticker = pair["first_ticker"]
         self.second_ticker = pair["second_ticker"]
-        # share the consumer's MarketView so obi/mid are market-only live
+        # share the consumer's MarketView so obi/mid are market-only live; the engine
+        # tracks + maintains EMAs only for the alphas/half-lives the config references
         self.alpha_engine = PairAlphaEngine(
             pair, consumer.view, combo = getattr(params, "combo", None),
-            track_agg = "agg" in params.alpha_name,
+            track_agg = self.cfg.track_agg(), track_obi_ma = self.cfg.track_obi_ma(),
+            half_lives = self.cfg.half_lives(),
         )
         self.inventory: dict[str, float] = {self.first_ticker: 0.0, self.second_ticker: 0.0}
 
@@ -108,10 +112,15 @@ class PairMM:
         """Net pair-space exposure: positive = net long first team."""
         return self.inventory[self.first_ticker] - self.inventory[self.second_ticker]
 
+    def _skew_bias(self, lts: float) -> tuple[float, float]:
+        """(yes_bias, no_bias) subtracted from the skew threshold per side. Base:
+        none. WCStrategy overrides with losing_leg_bias (live-score-aware)."""
+        return 0.0, 0.0
+
     def _exit_quotes(self, ticker: str) -> dict:
         """Liquidation-only passive quotes (same-ticker netting), never priced
         worse than the aggressive entry VWAP -/+ aggro_profit (when known)."""
-        p = self.params
+        p = self.cfg
         tob = self._leg_tob(ticker)
         if tob.yes_bid is None or tob.yes_ask is None or tob.spread is None:
             return {}
@@ -145,7 +154,7 @@ class PairMM:
         if tob.yes_bid is None or tob.yes_ask is None:
             return {}
         inv = self.inventory[ticker]
-        S = self.params.per_order_size
+        S = self.cfg.per_order_size
         if is_neg(inv):                       # short yes -> bid to cover at the touch
             return {"yes": [(tob.yes_bid, min(S, -inv))]}
         if is_pos(inv):                       # long yes -> offer to sell at the touch
@@ -154,36 +163,40 @@ class PairMM:
 
     def _budget_clip(self, size: float, price: float) -> float:
         """Clip an ENTRY (cash-consuming) order to what the remaining budget can
-        buy at this price: min(size, (budget - deployed) // price) whole contracts.
-        No-op when no budget set. Reduce/netting orders free cash and are NOT clipped."""
-        budget = getattr(self.params, "budget", None)
+        buy at this price: min(size, (budget - deployed) / price) contracts (fractional
+        ok). No-op when no budget set. Reduce/netting orders free cash and are NOT clipped."""
+        budget = self.cfg.budget
         if budget is None or not is_pos(price):
             return size
-        affordable = max(0.0, budget - self.consumer._deployed_dollars()) // price
+        affordable = max(0.0, budget - self.consumer._deployed_dollars()) / price
         return min(size, affordable)
 
-    def _desired_sides(self, ticker: str, leg_alpha: float, lts: float = 0.0) -> dict:
-        """Map of side -> [(price, size)] quotes to rest, per the skew rules."""
-        p = self.params
+    def _desired_sides(self, ticker: str, gate_vals, lts: float = 0.0) -> dict:
+        """Map of side -> [(price, size)] quotes to rest. `gate_vals` is a list of
+        (signed_alpha_value, threshold) for EVERY configured alpha, ALL treated the
+        same: a side is quoted only if EVERY alpha clears its threshold for that side
+        (equivalently, blocked if ANY crosses it). gate_vals[0] is also the directional
+        value used for the optional improve / size_ref sizing (no other special role)."""
+        c = self.cfg
         # Dataset rule: no trading earlier than 1h before the game starts
-        game_starts = getattr(p, "game_starts", None)
+        game_starts = getattr(self.params, "game_starts", None)
         if game_starts:
             start = game_starts.get(self.pair["event_ticker"])
             if start is not None and lts and lts < start - 3600:
                 return {}
         # Hybrid aggro-entry mode: passive quotes are EXIT-ONLY (same-ticker
         # netting); entries happen aggressively in requote's latch block
-        if getattr(p, "aggro_entry", None) or getattr(p, "aggro_neg", None):
+        if c.aggro_entry or c.aggro_neg:
             return self._exit_quotes(ticker)
         tob = self._leg_tob(ticker)
         if tob.yes_bid is None or tob.yes_ask is None:
             return {}
-        if tob.spread is None or tob.spread > p.max_spread + 1e-9:
+        if tob.spread is None or tob.spread > c.max_spread + 1e-9:
             return {}
         # Never quote into a transiently crossed/locked book (mid-sweep states)
         if tob.spread < 0.005:
             return {}
-        if tob.yes_bid < p.price_min or tob.yes_ask > p.price_max:
+        if tob.yes_bid < c.price_min or tob.yes_ask > c.price_max:
             # outside the quotable band: no alpha MM, but still work out of any
             # open position (reduce-only, no alpha); {} when flat
             return self._liquidate_quotes(ticker)
@@ -191,34 +204,35 @@ class PairMM:
         # Optional pre-33fe652 behaviour, gated by free_budget: when over budget,
         # quote ONLY reduce-only same-ticker netting (frees cash). Default off ->
         # budget is enforced per-order by _budget_clip below (no separate guard).
-        over_budget = (getattr(p, "free_budget", False)
-                       and getattr(p, "budget", None) is not None
-                       and self.consumer._deployed_dollars() + 0.6 * p.per_order_size > p.budget)
+        over_budget = (c.free_budget and c.budget is not None
+                       and self.consumer._deployed_dollars() + 0.6 * c.per_order_size > c.budget)
 
         # Risk variable the caps/skew operate on: per-ticker inventory by
         # default, or net pair exposure mapped into this leg's yes-space
         # (--pair-risk: buying YES here and NO on the other leg are the same
         # pair direction, so either leg's fills can flatten it).
-        if p.pair_risk:
+        if c.pair_risk:
             sign = 1.0 if ticker == self.first_ticker else -1.0
             inv = self._pair_exposure() * sign
         else:
             inv = self.inventory[ticker]
-        S = p.per_order_size
+        S = c.per_order_size
         yes_price = tob.yes_bid
         no_price = round(1.0 - tob.yes_ask, 6)
 
+        leg_alpha = gate_vals[0][0]      # directional value (improve / size_ref)
+        thr0 = gate_vals[0][1]
         # Improve mode: with a 2+ tick spread, step one side 1 tick inside for
         # instant queue priority (still passive; capture = spread - 1 tick).
         # Prefer the inventory-reducing side, else the alpha-favored side.
-        if p.improve and tob.spread >= 0.019:
+        if c.improve and tob.spread >= 0.019:
             if is_pos(inv):
                 improve_side = "no"
             elif is_neg(inv):
                 improve_side = "yes"
-            elif leg_alpha >= p.skew_threshold:
+            elif leg_alpha >= thr0:
                 improve_side = "yes"
-            elif leg_alpha <= -p.skew_threshold:
+            elif leg_alpha <= -thr0:
                 improve_side = "no"
             else:
                 improve_side = None
@@ -230,13 +244,12 @@ class PairMM:
         # Alpha-proportional sizing: scale the order toward S as |alpha|
         # approaches size_ref (floor 10% of S). Position limits stay fixed.
         size = S
-        size_ref = getattr(p, "size_ref", None)
-        if size_ref:
-            size = max(0.1 * S, S * min(1.0, abs(leg_alpha) / size_ref))
+        if c.size_ref:
+            size = max(0.1 * S, S * min(1.0, abs(leg_alpha) / c.size_ref))
 
-        if yes_price > p.price_max + 1e-9:
+        if yes_price > c.price_max + 1e-9:
             yes_price = None  # improve step pushed the quote outside bounds
-        if no_price > 1.0 - p.price_min + 1e-9:
+        if no_price > 1.0 - c.price_min + 1e-9:
             no_price = None
 
         # One quote per side at the joined best price (<=1 resting/side, enforced
@@ -259,19 +272,23 @@ class PairMM:
             if is_pos(tkr_inv) and no_price is not None:
                 return {"no": [(no_price, min(size, tkr_inv))]}
             return {}
-        square_off = getattr(p, "square_off", False)
-        cap = p.inventory_cap
+        square_off = c.square_off
+        cap = c.inventory_cap
         desired = {}
-        # add side: clip the order to BOTH the remaining budget and the remaining
-        # position-limit room (cap - inv for yes, inv + cap for no) so we top up to
-        # the cap instead of refusing a full-size order that would overshoot it.
-        add_yes = leg_alpha > -p.skew_threshold and inv < cap
+        # losing_leg_bias: tighten the ENTRY threshold on the side betting on a
+        # not-currently-true outcome (from the live score) -> harder to add there.
+        # (yes_bias, no_bias) = 0 in the base; WCStrategy._skew_bias is score-aware.
+        bias_yes, bias_no = self._skew_bias(lts)
+        # SYMMETRIC alpha gate: a side is allowed only if EVERY alpha clears its
+        # threshold for that side (yes wants value > -(thr - bias); no wants
+        # value < (thr - bias)). For one alpha this is the legacy skew gate.
+        add_yes = inv < cap and all(v > -(t - bias_yes) for v, t in gate_vals)
         reduce_yes = square_off and is_neg(inv)
         if yes_price is not None and (add_yes or reduce_yes):
             sz = min(self._budget_clip(size, yes_price), cap - inv) if add_yes else min(size, -inv)
             if is_pos(sz):
                 desired["yes"] = shape("yes", yes_price, sz)
-        add_no = leg_alpha < p.skew_threshold and inv > -cap
+        add_no = inv > -cap and all(v < (t - bias_no) for v, t in gate_vals)
         reduce_no = square_off and is_pos(inv)
         if no_price is not None and (add_no or reduce_no):
             sz = min(self._budget_clip(size, no_price), inv + cap) if add_no else min(size, inv)
@@ -301,21 +318,25 @@ class PairMM:
                                         {"event": event, "alpha": alpha, "expo": expo})
 
     def requote(self, lts: float):
-        per_leg = getattr(self.params, "per_leg_alpha", False)
-        if not per_leg:
-            # Single lazy alpha computation per event, mirrored across legs
-            if self.consumer._timing:
-                self.consumer._evt["alpha_start"] = time.time()      # #3
-            base = self.alpha_engine.value_of(self.params.alpha_name, lts)
-            base = 0.0 if base is None else base
-            if self.consumer._timing:
-                self.consumer._evt["alpha"] = base
+        c = self.cfg
+        per_leg = c.per_leg_alpha
+        if self.consumer._timing:
+            self.consumer._evt["alpha_start"] = time.time()      # #3
+        # Evaluate each configured alpha once (raw, then mirrored across legs by sign).
+        base_vals = [(self.alpha_engine.value_of(g.name, lts) or 0.0, g.threshold)
+                     for g in c.alphas]
+        if self.consumer._timing:
+            self.consumer._evt["alpha"] = base_vals[0][0]
         event = self.pair["event_ticker"]
         expo = self._pair_exposure()
         for ticker, leg_sign in ((self.first_ticker, 1.0), (self.second_ticker, -1.0)):
-            leg_alpha = (self._leg_alpha_per_leg(lts, ticker, leg_sign)
-                         if per_leg else base * leg_sign)
-            desired = self._desired_sides(ticker, leg_alpha, lts)
+            if per_leg:
+                gate_vals = [(self._leg_alpha_per_leg(lts, ticker, leg_sign),
+                              c.alphas[0].threshold)]
+            else:
+                gate_vals = [(v * leg_sign, t) for v, t in base_vals]
+            leg_alpha = gate_vals[0][0]
+            desired = self._desired_sides(ticker, gate_vals, lts)
             for side in ("yes", "no"):
                 want = (desired.get(side) or [None])[0]
                 self._reconcile_side(lts, ticker, side, want, leg_alpha, expo, event)
@@ -334,7 +355,7 @@ class PairMM:
             self.consumer.pnl.trade(ticker, "short", fill.qty, yes_space_price, is_maker = True)
         # Resting-order cleanup (drop/re-register the reduced order) is handled by
         # OrderRouter.on_fill from MMSimConsumer._process_fills.
-        alpha = self.alpha_engine.value_of(self.params.alpha_name, fill.lts)
+        alpha = self.alpha_engine.value_of(self.cfg.alpha_name, fill.lts)
         tob = self._leg_tob(ticker)
         self.consumer.log_fill(
             fill, self.pair["event_ticker"], yes_space_price,
@@ -360,11 +381,14 @@ class SingleMM:
         self.second_ticker = None
         self.consumer = consumer
         self.params = params
-        # share the consumer's MarketView so obi/mid are market-only live
+        self.cfg = consumer.cfg
+        # share the consumer's MarketView so obi/mid are market-only live; the engine
+        # tracks + maintains EMAs only for the alphas/half-lives the config references
         self.alpha_engine = SingleAlphaEngine(
             ticker, consumer.view, combo = getattr(params, "combo", None),
-            track_agg = "agg" in params.alpha_name,
-            track_obi_ma = ("obi_ma" in params.alpha_name or "obi_dev" in params.alpha_name))
+            track_agg = self.cfg.track_agg(),
+            track_obi_ma = self.cfg.track_obi_ma(),
+            half_lives = self.cfg.half_lives())
         self.inventory: dict[str, float] = {ticker: 0.0}
         self._latch = 0  # aggro-entry hysteresis direction
         self._armed = False  # entry allowed only until liquidation starts
@@ -392,13 +416,14 @@ class SingleMM:
     _exit_quotes = PairMM._exit_quotes
     _liquidate_quotes = PairMM._liquidate_quotes
     _reconcile_side = PairMM._reconcile_side
+    _skew_bias = PairMM._skew_bias
     on_fill = PairMM.on_fill
 
     def _aggro_entry(self, lts: float, alpha: float):
         """Latched aggressive entry: take the touch toward +/-aggro_limit when
         the alpha crosses +/-aggro_entry; the latch re-arms on zero-cross.
         Exits are handled by the passive reduce-only quotes."""
-        p = self.params
+        p = self.cfg
         inv = self.inventory[self.ticker]
         if is_zero(inv):
             self._entry_px = None
@@ -485,7 +510,7 @@ class SingleMM:
 
     def _take(self, lts: float, direction: int, alpha: float):
         """Aggressive taker entry toward +/-aggro_limit in YES space."""
-        p = self.params
+        p = self.cfg
         inv = self.inventory[self.ticker]
         tob = self._leg_tob(self.ticker)
         if tob.yes_bid is None or tob.yes_ask is None or tob.spread is None:
@@ -522,16 +547,18 @@ class SingleMM:
                                 price, qty, alpha, None, self.inventory[self.ticker])
 
     def requote(self, lts: float):
+        c = self.cfg
         if self.consumer._timing:
             self.consumer._evt["alpha_start"] = time.time()      # #3 alpha computation start
-        alpha = self.alpha_engine.value_of(self.params.alpha_name, lts)
-        if alpha is None:
-            alpha = 0.0
+        # one market (leg_sign = +1): evaluate every configured alpha + its threshold
+        gate_vals = [(self.alpha_engine.value_of(g.name, lts) or 0.0, g.threshold)
+                     for g in c.alphas]
+        alpha = gate_vals[0][0]
         if self.consumer._timing:
             self.consumer._evt["alpha"] = alpha
-        if getattr(self.params, "aggro_entry", None) or getattr(self.params, "aggro_neg", None):
+        if c.aggro_entry or c.aggro_neg:
             self._aggro_entry(lts, alpha)
-        desired = self._desired_sides(self.ticker, alpha, lts)
+        desired = self._desired_sides(self.ticker, gate_vals, lts)
         self._apply_desired(lts, desired, alpha)
 
     def _apply_desired(self, lts: float, desired: dict, alpha: float):
@@ -572,6 +599,35 @@ class WCStrategy(SingleMM):
                 f"WCStrategy: no game clock for {event_ticker}. Run espn_clock.py to "
                 f"populate wc_clocks.json — refusing to sim ungated (see project_status).")
 
+    def _skew_bias(self, lts: float) -> tuple[float, float]:
+        """losing_leg_bias: bias AGAINST entering the side that bets on a NOT-
+        currently-true outcome (from the live score). Block YES (buy this leg's
+        outcome) when it isn't the current outcome; block NO (sell it) when it IS.
+        Returns (yes_bias, no_bias) to subtract from the threshold. Inert when the
+        delta is 0 or no clock/score is available."""
+        delta = self.cfg.losing_leg_bias
+        if delta <= 0:
+            return 0.0, 0.0
+        c = (getattr(self.consumer, "live_clocks", {}).get(self.event_ticker)
+             if self._live_clock else self.clock)
+        if not c:
+            return 0.0, 0.0
+        teams = self.event_ticker[-6:]
+        teamA, teamB = teams[:3], teams[3:]
+        gA = gB = 0
+        for e in c.get("events", []):
+            if e.get("kind") == "goal" and e.get("wc", float("inf")) <= lts:
+                if e.get("team") == teamA:
+                    gA += 1
+                elif e.get("team") == teamB:
+                    gB += 1
+        cur = "A" if gA > gB else ("B" if gB > gA else "TIE")   # current in-game outcome
+        suffix = self.ticker.rsplit("-", 1)[-1]                 # this leg's outcome code
+        leg = "TIE" if suffix == "TIE" else ("A" if suffix == teamA else "B")
+        # block YES (buy) when this leg's outcome isn't current; block NO (sell)
+        # when it IS current -> reduce that side's threshold by the bias delta.
+        return (delta if leg != cur else 0.0, delta if leg == cur else 0.0)
+
     def _phase(self, lts: float) -> str:
         if self._ignore_clock:
             return "main"                              # live test: trade regardless of clock
@@ -606,10 +662,10 @@ class WCStrategy(SingleMM):
         # liquidation: reduce-only. liquidate_no_alpha (variant) = work the position
         # to flat unconditionally; default = alpha-gated (only exit when the alpha
         # supports the exit direction, else hold to settlement).
-        if getattr(self.params, "liquidate_no_alpha", False):
+        if self.cfg.liquidate_no_alpha:
             self._apply_desired(lts, self._exit_quotes(self.ticker), 0.0)
             return
-        alpha = self.alpha_engine.value_of(self.params.alpha_name, lts)
+        alpha = self.alpha_engine.value_of(self.cfg.alpha_name, lts)
         alpha = 0.0 if alpha is None else alpha
         inv = self.inventory[self.ticker]
         support = (is_pos(inv) and alpha <= 0) or (is_neg(inv) and alpha >= 0)
@@ -627,6 +683,10 @@ class MMSimConsumer:
         # subtract the own-ledger -> market-only.
         self.view = replayer.view
         self.params = params
+        # The decision-strategy spec (symmetric alpha-gate list + sizing/risk/budget
+        # knobs) the strategies read via self.cfg. Runtime/wiring (timing_emit, live,
+        # tickers, combo, game_starts, ...) stays on params.
+        self.cfg = StrategyConfig.from_params(params)
         # Live-only timing emitter (a live_ipc.TimingEmitter, or None in sim/sweep ->
         # ALL instrumentation below is inert and the sim path stays bit-identical).
         # `_evt` is the per-event timing context the driver (ProdExchange/LiveFeed)
@@ -646,11 +706,11 @@ class MMSimConsumer:
             # Feed delays default to 0 (equivalence test); AWS constants for realistic runs.
             self.exchange = SimExchange(
                 self.view,
-                fwd_delay = getattr(params, "forward_delay", FORWARD_DELAY_S),
-                ack_delay = getattr(params, "ack_delay", 0.0),
-                pub_delay = getattr(params, "pub_delay", 0.0),
-                fill_delay = getattr(params, "fill_delay", 0.0),
-                fill_pub_lag = getattr(params, "fill_pub_lag", 0.0),
+                fwd_delay = self.cfg.forward_delay,
+                ack_delay = self.cfg.ack_delay,
+                pub_delay = self.cfg.pub_delay,
+                fill_delay = self.cfg.fill_delay,
+                fill_pub_lag = self.cfg.fill_pub_lag,
                 on_deliver = self._deliver,
             )
             self.fill_engine = self.exchange.fill_engine     # alias (queue reads)
@@ -668,6 +728,10 @@ class MMSimConsumer:
                                   log = self.log_order)
         self._cur_lts = 0.0          # lts of the recorded message being processed
         self._fill_flag = False      # a fill landed this tick -> requote
+        # live-only: tickers whose market has resolved (market_lifecycle_v2
+        # determined/settled) -> never quote them again. Empty in sim (replay emits
+        # no lifecycle messages), so the requote skip is always-False -> bit-identical.
+        self.closed_markets: set[str] = set()
         # debug: shadow recorded-market book to assert market-only reads (book minus
         # our injected orders) == the pure recorded market, every tick.
         self._dbg = getattr(params, "debug_shadow", False)
@@ -789,11 +853,12 @@ class MMSimConsumer:
     def _game_of(self, mm):
         return mm.pair["event_ticker"] if mm.second_ticker is not None else mm.event_ticker
 
-    def _log_order_timing(self, ticker, side, action, price, qty, t_sent, t_done):
+    def _log_order_timing(self, ticker, side, action, price, qty, t_sent, t_done, coid):
         """OrderRouter on_order hook, called AFTER the order is placed (off the order's
         critical path). Assembles the per-order record from the strategy-stamped event
         context (`_evt`) + emits it to the logger. Every field is strategy-sourced; the
-        logger computes none of it."""
+        logger computes none of it. `client_order_id` joins this order to its exchange
+        ack/reject record (see _deliver)."""
         mm = self.mm_by_ticker.get(ticker)
         e = self._evt
         self._timing.emit({
@@ -802,6 +867,19 @@ class MMSimConsumer:
             "sent_to_router": t_sent, "router_done": t_done,
             "game": self._game_of(mm) if mm else None, "leg": ticker, "side": side,
             "action": action, "qty": qty, "price": price, "alpha": e.get("alpha"),
+            "client_order_id": coid,
+        })
+
+    def _log_ack(self, result, msg):
+        """Exchange response to one of our place/cancel orders, logged the SAME way as
+        order records (IPC queue -> logger -> acks.jsonl). `client_order_id` joins back
+        to the order record; `op` is place|cancel; on a reject `status`/`err` says why."""
+        self._timing.emit({
+            "type": "ack", "result": result, "read_ts": time.time(),
+            "exchange_ts": msg.get("ts_ms"), "op": msg.get("ack") or msg.get("kind"),
+            "leg": msg.get("market_ticker"), "side": msg.get("side"),
+            "client_order_id": msg["client_order_id"], "order_id": msg.get("order_id"),
+            "status": msg.get("status"), "err": msg.get("err"),
         })
 
     def _emit_decision(self, mm, lts: float):
@@ -813,7 +891,7 @@ class MMSimConsumer:
         # offline check can compare the instantaneous obi EXACTLY (book-state-based,
         # immune to the obi_ma warmup/cross-clock noise that confounds obi_dev).
         obi = (mm.alpha_engine.value_of("obi", lts)
-               if self.params.alpha_name.startswith("obi") else None)
+               if self.cfg.alpha_name.startswith("obi") else None)
         self._timing.emit({
             "type": "decision", "exchange_ts": e.get("exchange_ts"), "read_ts": e.get("read_ts"),
             "alpha_start": e.get("alpha_start"), "strategy_start": e.get("strategy_start"),
@@ -852,7 +930,11 @@ class MMSimConsumer:
             self.router.on_public_own_delta(msg)
         elif kind == "ack":
             self.router.on_ack(msg)
+            if self._timing:
+                self._log_ack("ack", msg)
         elif kind == "reject":                  # prod: exchange rejected a place/cancel
+            if self._timing:
+                self._log_ack("reject", msg)
             self.router.on_reject(msg["client_order_id"], msg["kind"])
         elif kind == "public_trade":
             mm = self.mm_by_ticker.get(msg["market_ticker"])
@@ -899,7 +981,7 @@ class MMSimConsumer:
         # separate logger off the private feed -> skip the in-process fill log.
         if self._timing:
             return
-        alpha = mm.alpha_engine.value_of(self.params.alpha_name, lts)
+        alpha = mm.alpha_engine.value_of(self.cfg.alpha_name, lts)
         tob = self.view.top(ticker)
         event = mm.pair["event_ticker"] if mm.second_ticker is not None else mm.event_ticker
         self.fill_rows.append({
@@ -929,7 +1011,7 @@ class MMSimConsumer:
         else:
             mid = mm.alpha_engine._mid()
             open_qty = abs(mm.inventory[mm.ticker])
-        alpha = mm.alpha_engine.value_of(self.params.alpha_name, lts)
+        alpha = mm.alpha_engine.value_of(self.cfg.alpha_name, lts)
         tickers = ([mm.first_ticker, mm.second_ticker]
                    if mm.second_ticker is not None else [mm.ticker])
         real_ev = sum(self.pnl.realized_by_ticker.get(t, 0.0) for t in tickers)
@@ -965,6 +1047,29 @@ class MMSimConsumer:
                 if is_pos(qty):
                     self.view.apply_delta(ticker, side, pk, qty, is_own = True)
 
+    def on_market_lifecycle(self, m: dict):
+        """Live: a market_lifecycle_v2 message. On terminal resolution
+        (determined/settled) of a market we trade, stop quoting it: cancel any
+        resting order on every leg of the owning strategy and mark it closed so
+        on_book/on_trade never requote it again. Other event types are ignored
+        (deactivated may be a transient pause; the book guards handle that)."""
+        if m.get("event_type") not in ("determined", "settled"):
+            return
+        ticker = m.get("market_ticker")
+        mm = self.mm_by_ticker.get(ticker)
+        if mm is None or ticker in self.closed_markets:      # not ours, or already closed
+            return
+        lts = self._cur_lts
+        legs = ([mm.first_ticker, mm.second_ticker]
+                if mm.second_ticker is not None else [mm.ticker])
+        for t in legs:
+            self.closed_markets.add(t)
+            ctx = {"event": mm.pair["event_ticker"], "alpha": None, "expo": mm.inventory.get(t, 0.0)}
+            for side in ("yes", "no"):
+                self.router.set_target(lts, t, side, None, ctx)
+        print(f"[lifecycle] {ticker} {m['event_type']} result={m.get('result')} "
+              f"settle={m.get('settlement_value')} -> stop trading {legs}")
+
     def on_book(self, lts: float, ticker: str, delta_msg):
         mm = self.mm_by_ticker.get(ticker)
         if mm is None:
@@ -996,6 +1101,8 @@ class MMSimConsumer:
         # and alpha changes from deep-book deltas are acted on immediately.
         self._record_mid(lts, ticker)
         mm.alpha_engine.on_book(lts, ticker)
+        if ticker in self.closed_markets:                  # market resolved -> never requote
+            return
         if self._timing:
             self._evt["strategy_start"] = time.time()      # #4
         mm.requote(lts)
@@ -1017,6 +1124,8 @@ class MMSimConsumer:
         if self._dbg:
             self._check_shadow(ticker, lts, "trade")
         self._record_mid(lts, ticker)
+        if ticker in self.closed_markets:                  # market resolved -> never requote
+            return
         if self._timing:
             self._evt["strategy_start"] = time.time()      # #4
         mm.requote(lts)
@@ -1117,6 +1226,14 @@ def main():
                         help = "3-leg spike trade: siblings < -t_neg (own > t_pos = --aggro-entry, optional) -> buy YES here + NO on siblings")
     parser.add_argument("--football", action = "store_true",
                         help = "WC/soccer phase strategy: no-trade pre-5'/half-time, MM 5'->85', liquidate-only 85'->end (uses ESPN game clocks)")
+    parser.add_argument("--free-budget", action = "store_true",
+                        help = "Over budget: quote ONLY reduce-only same-ticker netting (pre-33fe652 behaviour)")
+    parser.add_argument("--liquidate-no-alpha", action = "store_true",
+                        help = "WC 85'+: liquidate the position unconditionally (drop the alpha-support gate)")
+    parser.add_argument("--losing-leg-bias", type = float, default = 0.0,
+                        help = "WC: tighten the entry threshold by this delta on the side betting on a not-currently-true outcome (per the live score)")
+    parser.add_argument("--realistic", action = "store_true",
+                        help = "Prod-faithful SimExchange feed delays (REALISTIC_DELAYS: ack22/pub28/fill16ms)")
     parser.add_argument("--tag", type = str, default = None, help = "Output dir name")
     args = parser.parse_args()
 
@@ -1125,6 +1242,11 @@ def main():
         import json
         with open(args.combo_file) as f:
             args.combo = json.load(f)
+
+    if args.realistic:
+        from research.hft.exchange import REALISTIC_DELAYS
+        for k, v in REALISTIC_DELAYS.items():
+            setattr(args, k, v)
 
     if args.tag is None:
         args.tag = (

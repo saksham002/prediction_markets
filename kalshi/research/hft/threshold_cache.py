@@ -19,7 +19,10 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from types import SimpleNamespace
+
 from research.hft.alphas import SingleAlphaEngine
+from research.hft.strategy_config import StrategyConfig
 from research.hft.replay import Replayer
 
 CACHE_DIR = Path("/data/user_data/saksham3/kalshi_hft/studies/threshold_cache")
@@ -37,12 +40,20 @@ class _ThreshConsumer:
         self.engines = {}
         self.vals = defaultdict(list)
         self.last = {}
+        # derive engine tracking + half-life sets from the requested alpha NAMES so
+        # value_of(<name>) is populated (e.g. agg_dev needs track_agg + an agg/agg_dev
+        # EMA at its HL; obi_dev needs obi_ma at its HL).
+        cfg = StrategyConfig.from_params(SimpleNamespace(
+            alphas = [{"name": a, "threshold": 0.0} for a in alphas]))
+        self._eng_kw = dict(track_agg = cfg.track_agg(),
+                            track_obi_ma = cfg.track_obi_ma(),
+                            half_lives = cfg.half_lives())
 
     def on_meta(self, lts, meta):
         for ev in meta.get("events", []):
             if ev["series"] == "KXWCGAME":
                 for t in ev["tickers"]:
-                    self.engines[t] = SingleAlphaEngine(t, self.replayer.books, track_obi_ma = True)
+                    self.engines[t] = SingleAlphaEngine(t, self.replayer.books, **self._eng_kw)
 
     def on_trade(self, lts, msg):
         e = self.engines.get(msg["market_ticker"])

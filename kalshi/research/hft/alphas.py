@@ -28,6 +28,49 @@ MOM_HLS = {"1s": 1, "5s": 5, "10s": 10, "30s": 30, "120s": 120, "300s": 300, "60
 OBI_MA_HLS = {"1s": 1, "5s": 5, "15s": 15, "60s": 60, "300s": 300, "900s": 900}
 
 
+def _resolve_hls(half_lives, component, default):
+    """Pick the half-life set for one engine component. half_lives=None -> the
+    module default (full set, bit-identical legacy behaviour); a dict -> only the
+    requested component's labels (lazy; absent component -> empty -> not maintained)."""
+    return default if half_lives is None else half_lives.get(component, {})
+
+
+class EmaSignal:
+    """One scalar signal's lazy EMAs at configured half-lives — the SINGLE place
+    the moving-average (`ma`) and deviation (`dev` = value - ma) operations live.
+    obi (obi_ma/obi_dev), mid (mom) and the agg-deviation trailing average all use
+    it instead of duplicating the EMA loop. `update` matches the legacy inline
+    on_book loops EXACTLY (seed-on-first; same alpha_w expression) -> bit-identical."""
+
+    __slots__ = ("_hls", "_ema", "_last_ts")
+
+    def __init__(self, half_lives: dict[str, float]):
+        self._hls = dict(half_lives)
+        self._ema: dict[str, float | None] = {label: None for label in self._hls}
+        self._last_ts: float | None = None
+
+    def update(self, value, ts):
+        if value is None:
+            return
+        if self._last_ts is None:
+            for label in self._ema:
+                self._ema[label] = value
+        else:
+            dt = max(ts - self._last_ts, 0.0)
+            for label, hl in self._hls.items():
+                alpha_w = 1.0 - math.exp(-math.log(2) * dt / hl)
+                self._ema[label] += alpha_w * (value - self._ema[label])
+        self._last_ts = ts
+
+    def ma(self, label):
+        return self._ema.get(label)
+
+    def dev(self, cur, label):
+        """current value minus its trailing EMA at `label` (the deviation signal)."""
+        ma = self._ema.get(label)
+        return None if (cur is None or ma is None) else cur - ma
+
+
 class _OwnOrderMixin:
     """Thin shim so both engines expose register_resting / mark_own_fill that
     delegate to the shared MarketView (the single own-order ledger). Live-only;
@@ -44,12 +87,15 @@ class _OwnOrderMixin:
 
 class PairAlphaEngine(_OwnOrderMixin):
     def __init__(self, pair: dict, books: dict, combo: dict | None = None,
-                 track_obi_ma: bool = False, track_agg: bool = False):
+                 track_obi_ma: bool = False, track_agg: bool = False,
+                 half_lives: dict | None = None):
         """
         combo: optional {"weights": {name: w}, "means": {name: m}, "stds": {name: s}}
         adding a "combo" alpha = sum_i w_i * (alpha_i - m_i) / s_i  (fit_combo.py)
         track_obi_ma: maintain smoothed-OBI EMAs (loggers/studies only — the
         per-book-event OBI recompute is expensive and unused by strategies)
+        half_lives: per-component {label: seconds} (from StrategyConfig.half_lives());
+        None -> the module default sets (full, bit-identical legacy behaviour).
         """
         self.pair = pair
         # accept a MarketView (preferred, shared with the consumer) or a raw books
@@ -63,9 +109,15 @@ class PairAlphaEngine(_OwnOrderMixin):
         )
         self.first_ticker = pair["first_ticker"]
         self.second_ticker = pair["second_ticker"]
+        # config-driven half-life sets (None -> full module defaults)
+        self._tfma_hls = _resolve_hls(half_lives, "tfma", TFMA_HLS)
+        self._agg_hls = _resolve_hls(half_lives, "agg", TFMA_HLS)
+        self._mom_hls = _resolve_hls(half_lives, "mom", MOM_HLS)
+        self._obi_ma_hls = _resolve_hls(half_lives, "obi_ma", OBI_MA_HLS)
+        self._agg_dev_hls = _resolve_hls(half_lives, "agg_dev", {})
         self.tfma = TradeFillMA(
             pair_tickers = (self.first_ticker, self.second_ticker),
-            half_life_seconds = TFMA_HLS,
+            half_life_seconds = self._tfma_hls or {"1s": 1},   # TradeFillMA needs >=1 HL
             time_source = "exchange",
         )
         # Aggregation alpha needs every book delta — only maintained on request
@@ -74,12 +126,13 @@ class PairAlphaEngine(_OwnOrderMixin):
         )
         self.aggflow = AggFlowMA(
             self.view, pair_tickers = (self.first_ticker, self.second_ticker),
-            half_life_seconds = TFMA_HLS,
+            half_life_seconds = self._agg_hls,
         ) if self.track_agg else None
-        self._mid_ema: dict[str, float | None] = {label: None for label in MOM_HLS}
-        self._mid_ema_last_ts: float | None = None
-        self._obi_ema: dict[str, float | None] = {label: None for label in OBI_MA_HLS}
-        self._obi_ema_last_ts: float | None = None
+        self.mid_sig = EmaSignal(self._mom_hls)
+        self.obi_sig = EmaSignal(self._obi_ma_hls)
+        # agg_dev_<hl> = agg_<hl> - EMA_<hl>(agg_<hl>): one trailing EMA per agg-dev HL
+        self.agg_dev_sigs = {label: EmaSignal({label: hl})
+                             for label, hl in self._agg_dev_hls.items()}
 
     def _leg_mid(self, ticker: str) -> float | None:
         yb, _ = self.view.best_bid(ticker, "yes")
@@ -106,6 +159,7 @@ class PairAlphaEngine(_OwnOrderMixin):
         self.tfma.on_message("trade", msg)
         if self.aggflow is not None:
             self.aggflow.on_trade(msg)
+        self._advance_agg_dev(lts)
 
     def on_delta(self, lts: float, ticker: str, msg: dict):
         if self.aggflow is None or self.view.is_own_delta(msg):
@@ -113,6 +167,16 @@ class PairAlphaEngine(_OwnOrderMixin):
         ts = float(msg["ts_ms"]) / 1000.0 if "ts_ms" in msg else lts
         self.aggflow.on_delta(ticker, msg["side"], float(msg["price_dollars"]),
                               float(msg["delta_fp"]), ts)
+
+    def _advance_agg_dev(self, lts: float):
+        """Advance the agg trailing EMAs (agg_dev = agg - EMA(agg)); no-op unless an
+        agg_dev HL is configured. Sampled on book+trade (decay-on-read keeps agg
+        current), mirroring how obi_ma is sampled per book event."""
+        if not self.agg_dev_sigs or self.aggflow is None:
+            return
+        cur = self.aggflow.values_lvl(now = lts)
+        for label, sig in self.agg_dev_sigs.items():
+            sig.update(cur.get(label), lts)
 
     def _pair_obi(self) -> float | None:
         # cache per book+ledger state: market-only obi = book minus our own-resting
@@ -133,50 +197,32 @@ class PairAlphaEngine(_OwnOrderMixin):
         return self._pobi_cache
 
     def on_book(self, lts: float, ticker: str):
-        mid = self.pair_mid()
-        if mid is not None:
-            if self._mid_ema_last_ts is None:
-                for label in MOM_HLS:
-                    self._mid_ema[label] = mid
-            else:
-                dt = max(lts - self._mid_ema_last_ts, 0.0)
-                for label, hl in MOM_HLS.items():
-                    alpha_w = 1.0 - math.exp(-math.log(2) * dt / hl)
-                    self._mid_ema[label] += alpha_w * (mid - self._mid_ema[label])
-            self._mid_ema_last_ts = lts
-
-        if not self.track_obi_ma:
-            return
-        obi = self._pair_obi()
-        if obi is not None:
-            if self._obi_ema_last_ts is None:
-                for label in OBI_MA_HLS:
-                    self._obi_ema[label] = obi
-            else:
-                dt = max(lts - self._obi_ema_last_ts, 0.0)
-                for label, hl in OBI_MA_HLS.items():
-                    alpha_w = 1.0 - math.exp(-math.log(2) * dt / hl)
-                    self._obi_ema[label] += alpha_w * (obi - self._obi_ema[label])
-            self._obi_ema_last_ts = lts
+        self.mid_sig.update(self.pair_mid(), lts)
+        if self.track_obi_ma:
+            self.obi_sig.update(self._pair_obi(), lts)
+        self._advance_agg_dev(lts)
 
     def values(self, now: float) -> dict[str, float | None]:
         """All alpha values. `now` in exchange-epoch seconds (lts works live and in replay)."""
         out: dict[str, float | None] = {}
         raw = self.tfma.values(now = now)
         pw = self.tfma.values_pw(now = now)
-        for label in TFMA_HLS:
+        for label in self._tfma_hls:
             out[f"tfma_{label}"] = raw[label]
             out[f"tfma_pw_{label}"] = pw[label]
 
         agg_lvl = self.aggflow.values_lvl(now = now) if self.aggflow is not None else None
         agg_pw = self.aggflow.values_pw(now = now) if self.aggflow is not None else None
-        for label in TFMA_HLS:
+        for label in self._agg_hls:
             out[f"agg_{label}"] = agg_lvl[label] if agg_lvl is not None else None
             out[f"agg_pw_{label}"] = agg_pw[label] if agg_pw is not None else None
+        for label in self._agg_dev_hls:
+            cur = agg_lvl[label] if agg_lvl is not None else None
+            out[f"agg_dev_{label}"] = self.agg_dev_sigs[label].dev(cur, label)
 
         out["obi"] = self._pair_obi()
-        for label in OBI_MA_HLS:
-            out[f"obi_ma_{label}"] = self._obi_ema[label]
+        for label in self._obi_ma_hls:
+            out[f"obi_ma_{label}"] = self.obi_sig.ma(label)
 
         # Agreement gate: OBI magnitude, zeroed when dollar-flow disagrees in sign
         obi_v = out["obi"]
@@ -189,12 +235,8 @@ class PairAlphaEngine(_OwnOrderMixin):
             out["agree"] = 0.0
 
         mid = self.pair_mid()
-        for label in MOM_HLS:
-            ema = self._mid_ema[label]
-            if mid is None or ema is None:
-                out[f"mom_{label}"] = None
-            else:
-                out[f"mom_{label}"] = mid - ema
+        for label in self._mom_hls:
+            out[f"mom_{label}"] = self.mid_sig.dev(mid, label)
 
         # OBI gated by short-term momentum agreement (MLB shows continuation:
         # mom_5s r=+0.13..0.18 on MLB-only, unlike the pooled reversal)
@@ -231,11 +273,11 @@ class PairAlphaEngine(_OwnOrderMixin):
         if name == "obi":
             return self._pair_obi()
         if name.startswith("obi_ma_"):
-            return self._obi_ema[name[7:]]
+            return self.obi_sig.ma(name[7:])
+        if name.startswith("obi_dev_"):
+            return self.obi_sig.dev(self._pair_obi(), name[len("obi_dev_"):])
         if name.startswith("mom_"):
-            mid = self.pair_mid()
-            ema = self._mid_ema[name[4:]]
-            return None if (mid is None or ema is None) else mid - ema
+            return self.mid_sig.dev(self.pair_mid(), name[4:])
         if name == "agree_om":
             obi_v = self._pair_obi()
             mom_v = self.value_of("mom_5s", now)
@@ -252,6 +294,12 @@ class PairAlphaEngine(_OwnOrderMixin):
             return self.tfma.values_pw(now = now)[name[8:]]
         if name.startswith("tfma_"):
             return self.tfma.values(now = now)[name[5:]]
+        if name.startswith("agg_dev_"):
+            label = name[len("agg_dev_"):]
+            sig = self.agg_dev_sigs.get(label)
+            if self.aggflow is None or sig is None:
+                return None
+            return sig.dev(self.aggflow.values_lvl(now = now).get(label), label)
         if name.startswith("agg_pw_"):
             return None if self.aggflow is None else self.aggflow.values_pw(now = now)[name[7:]]
         if name.startswith("agg_"):
@@ -304,7 +352,8 @@ class SingleAlphaEngine(_OwnOrderMixin):
     tfma_pw_{hl}, agree_om (obi gated by mom_5s sign agreement)."""
 
     def __init__(self, ticker: str, books: dict, track_obi_ma: bool = False,
-                 combo: dict | None = None, track_agg: bool = False):
+                 combo: dict | None = None, track_agg: bool = False,
+                 half_lives: dict | None = None):
         self.ticker = ticker
         # Polymorphism with PairAlphaEngine for samplers/strategies: a single
         # market is its own "pair" with both legs the same ticker
@@ -318,17 +367,25 @@ class SingleAlphaEngine(_OwnOrderMixin):
         self.track_obi_ma = track_obi_ma or bool(
             combo and any(k.startswith("obi_ma") for k in combo["weights"])
         )
-        self.tfma = TradeFillMA(ticker, half_life_seconds = TFMA_HLS, time_source = "exchange")
+        # config-driven half-life sets (None -> full module defaults)
+        self._tfma_hls = _resolve_hls(half_lives, "tfma", TFMA_HLS)
+        self._agg_hls = _resolve_hls(half_lives, "agg", TFMA_HLS)
+        self._mom_hls = _resolve_hls(half_lives, "mom", MOM_HLS)
+        self._obi_ma_hls = _resolve_hls(half_lives, "obi_ma", OBI_MA_HLS)
+        self._agg_dev_hls = _resolve_hls(half_lives, "agg_dev", {})
+        self.tfma = TradeFillMA(ticker, half_life_seconds = self._tfma_hls or {"1s": 1},
+                                time_source = "exchange")
         self.track_agg = track_agg or bool(
             combo and any(k.startswith("agg") for k in combo["weights"])
         )
         self.aggflow = AggFlowMA(
-            self.view, ticker, half_life_seconds = TFMA_HLS,
+            self.view, ticker, half_life_seconds = self._agg_hls,
         ) if self.track_agg else None
-        self._mid_ema: dict[str, float | None] = {label: None for label in MOM_HLS}
-        self._mid_ema_last_ts: float | None = None
-        self._obi_ema: dict[str, float | None] = {label: None for label in OBI_MA_HLS}
-        self._obi_ema_last_ts: float | None = None
+        self.mid_sig = EmaSignal(self._mom_hls)
+        self.obi_sig = EmaSignal(self._obi_ma_hls)
+        # agg_dev_<hl> = agg_<hl> - EMA_<hl>(agg_<hl>): one trailing EMA per agg-dev HL
+        self.agg_dev_sigs = {label: EmaSignal({label: hl})
+                             for label, hl in self._agg_dev_hls.items()}
 
     def _mid(self) -> float | None:
         yb, _ = self.view.best_bid(self.ticker, "yes")
@@ -358,6 +415,7 @@ class SingleAlphaEngine(_OwnOrderMixin):
         self.tfma.on_message("trade", msg)
         if self.aggflow is not None:
             self.aggflow.on_trade(msg)
+        self._advance_agg_dev(lts)
 
     def on_delta(self, lts: float, ticker: str, msg: dict):
         if self.aggflow is None or self.view.is_own_delta(msg):
@@ -366,50 +424,42 @@ class SingleAlphaEngine(_OwnOrderMixin):
         self.aggflow.on_delta(ticker, msg["side"], float(msg["price_dollars"]),
                               float(msg["delta_fp"]), ts)
 
-    def on_book(self, lts: float, ticker: str):
-        mid = self._mid()
-        if mid is not None:
-            if self._mid_ema_last_ts is None:
-                for label in MOM_HLS:
-                    self._mid_ema[label] = mid
-            else:
-                dt = max(lts - self._mid_ema_last_ts, 0.0)
-                for label, hl in MOM_HLS.items():
-                    alpha_w = 1.0 - math.exp(-math.log(2) * dt / hl)
-                    self._mid_ema[label] += alpha_w * (mid - self._mid_ema[label])
-            self._mid_ema_last_ts = lts
-
-        if not self.track_obi_ma:
+    def _advance_agg_dev(self, lts: float):
+        """Advance the agg trailing EMAs (agg_dev = agg - EMA(agg)); no-op unless an
+        agg_dev HL is configured. Sampled on book+trade (decay-on-read keeps agg
+        current), mirroring how obi_ma is sampled per book event."""
+        if not self.agg_dev_sigs or self.aggflow is None:
             return
-        obi = self._obi()
-        if obi is not None:
-            if self._obi_ema_last_ts is None:
-                for label in OBI_MA_HLS:
-                    self._obi_ema[label] = obi
-            else:
-                dt = max(lts - self._obi_ema_last_ts, 0.0)
-                for label, hl in OBI_MA_HLS.items():
-                    alpha_w = 1.0 - math.exp(-math.log(2) * dt / hl)
-                    self._obi_ema[label] += alpha_w * (obi - self._obi_ema[label])
-            self._obi_ema_last_ts = lts
+        cur = self.aggflow.values_lvl(now = lts)
+        for label, sig in self.agg_dev_sigs.items():
+            sig.update(cur.get(label), lts)
+
+    def on_book(self, lts: float, ticker: str):
+        self.mid_sig.update(self._mid(), lts)
+        if self.track_obi_ma:
+            self.obi_sig.update(self._obi(), lts)
+        self._advance_agg_dev(lts)
 
     def values(self, now: float) -> dict[str, float | None]:
         out: dict[str, float | None] = {}
         raw = self.tfma.values(now = now)
         pw = self.tfma.values_pw(now = now)
-        for label in TFMA_HLS:
+        for label in self._tfma_hls:
             out[f"tfma_{label}"] = raw[label]
             out[f"tfma_pw_{label}"] = pw[label]
 
         agg_lvl = self.aggflow.values_lvl(now = now) if self.aggflow is not None else None
         agg_pw = self.aggflow.values_pw(now = now) if self.aggflow is not None else None
-        for label in TFMA_HLS:
+        for label in self._agg_hls:
             out[f"agg_{label}"] = agg_lvl[label] if agg_lvl is not None else None
             out[f"agg_pw_{label}"] = agg_pw[label] if agg_pw is not None else None
+        for label in self._agg_dev_hls:
+            cur = agg_lvl[label] if agg_lvl is not None else None
+            out[f"agg_dev_{label}"] = self.agg_dev_sigs[label].dev(cur, label)
 
         out["obi"] = self._obi()
-        for label in OBI_MA_HLS:
-            out[f"obi_ma_{label}"] = self._obi_ema[label]
+        for label in self._obi_ma_hls:
+            out[f"obi_ma_{label}"] = self.obi_sig.ma(label)
 
         obi_v = out["obi"]
         tfma_v = out["tfma_pw_10s"]
@@ -419,9 +469,8 @@ class SingleAlphaEngine(_OwnOrderMixin):
             out["agree"] = obi_v if obi_v * tfma_v > 0 else 0.0
 
         mid = self._mid()
-        for label in MOM_HLS:
-            ema = self._mid_ema[label]
-            out[f"mom_{label}"] = None if (mid is None or ema is None) else mid - ema
+        for label in self._mom_hls:
+            out[f"mom_{label}"] = self.mid_sig.dev(mid, label)
 
         obi_v = out["obi"]
         mom_v = out["mom_5s"]
@@ -438,11 +487,9 @@ class SingleAlphaEngine(_OwnOrderMixin):
         if name == "obi":
             return self._obi()
         if name.startswith("obi_ma_"):
-            return self._obi_ema[name[7:]]
+            return self.obi_sig.ma(name[7:])
         if name.startswith("mom_"):
-            mid = self._mid()
-            ema = self._mid_ema[name[4:]]
-            return None if (mid is None or ema is None) else mid - ema
+            return self.mid_sig.dev(self._mid(), name[4:])
         if name.startswith("agree_om_"):
             # obi gated by momentum sign at a chosen HL (agree_om == mom_5s)
             obi_v = self._obi()
@@ -472,9 +519,7 @@ class SingleAlphaEngine(_OwnOrderMixin):
             return obi_v if obi_v * agg_v > 0 else 0.0
         if name.startswith("obi_dev_"):
             # obi minus its trailing EMA (obi_ma) at a chosen HL (deviation signal)
-            obi_v = self._obi()
-            ma = self._obi_ema[name[len("obi_dev_"):]]
-            return None if (obi_v is None or ma is None) else obi_v - ma
+            return self.obi_sig.dev(self._obi(), name[len("obi_dev_"):])
         if name.startswith("tfma_pw_ratio_"):
             return self.tfma.values_pw_ratio(now = now)[name[len("tfma_pw_ratio_"):]]
         if name.startswith("tfma_ratio_"):
@@ -487,6 +532,12 @@ class SingleAlphaEngine(_OwnOrderMixin):
             return self.tfma.values_pw(now = now)[name[8:]]
         if name.startswith("tfma_"):
             return self.tfma.values(now = now)[name[5:]]
+        if name.startswith("agg_dev_"):
+            label = name[len("agg_dev_"):]
+            sig = self.agg_dev_sigs.get(label)
+            if self.aggflow is None or sig is None:
+                return None
+            return sig.dev(self.aggflow.values_lvl(now = now).get(label), label)
         if name.startswith("agg_pw_"):
             return None if self.aggflow is None else self.aggflow.values_pw(now = now)[name[7:]]
         if name.startswith("agg_"):

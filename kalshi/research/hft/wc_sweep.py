@@ -1,17 +1,20 @@
-"""WC FootballStrategy sweep: train (first 12 WC games, chronological) vs test
-(next 8) for blind, raw obi, NORMALIZED flow (agg_ratio / tfma_pw_ratio =
-net/gross flow imbalance, scale-free so thresholds transfer across games), and
-obi-deviation (obi - obi_ma at 15s/60s/300s), over order size, position limit,
-and alpha threshold. Per-run deployed-capital `--budget` (run $1000 and $250);
-results -> sims/wc_sweep_r<budget>/, best config -> studies/wc_best_config_r<budget>.json.
-Reports in (train) vs out (test) net PnL.
+"""Generic WC strategy sweep.
 
-PROD-FAITHFUL execution (REALISTIC, 2026-06-17): SimExchange AWS feed delays
-(REALISTIC_DELAYS: ack 22ms / pub 28ms / fill 16ms) + the in-flight lock (no new
-order/cancel on a side while one is in flight) + 20ms forward fill latency. This
-materially lowers captured PnL vs the optimistic (delays=0) wc_sweep_88.
+Runs a SET of StrategyConfigs over an in-sample and an out-sample game set with
+prod-faithful SimExchange execution (REALISTIC_DELAYS + in-flight lock + 20ms
+forward fill latency), PERSISTS the per-(config, game) PnLs, and picks the best
+in-sample and best out-sample config FROM that store via a pluggable scoring
+function (default = mean per-game net). There is NO separate --collect re-run:
+`--finalize` reads the stored per-game PnLs (no sims re-run) and writes the
+best-in / best-out deploy specs.
 
-Usage: wc_sweep.py --shard I --num-shards N   |   wc_sweep.py --collect
+The runner (`run_shard` / `best_configs` / `finalize`) is generic over
+(in_games, out_games, configs, out_dir, score_fn). The DEFAULT study wired below
+is: obi_dev alone vs obi_dev AND agg_dev, over half-lives + percentile thresholds,
+$250 budget, free_budget on, size 200 / cap 1000, 21-6 chronological split. Edit
+`build_default_configs()` / the constants to sweep something else.
+
+Usage: wc_sweep.py --prep | --shard I --num-shards N | --finalize
 """
 import argparse
 import json
@@ -25,130 +28,164 @@ from exchange import REALISTIC_DELAYS
 DATASET = Path("/data/user_data/saksham3/kalshi_hft/dataset")
 SIMS = Path("/data/user_data/saksham3/kalshi_hft/sims")
 STUDIES = Path("/data/user_data/saksham3/kalshi_hft/studies")
-N_TRAIN = 20      # 20 in-sample / 4 out-sample (24-game dataset, chronological)
-FORWARD_DELAY = 0.020   # 20ms forward latency to gate fills
-RESULTS_SUFFIX = "_r204"   # restricted obi_dev sweep, 20-4 split (fresh dir)
-PCTS = [75, 90, 95]        # skew-threshold percentiles (of |alpha|, on the in-sample)
-SWEEP_ALPHAS = ["obi_dev_15s", "obi_dev_60s", "obi_dev_300s"]
-SIZES = [10, 50, 200]
-CAPS = [50, 200, 1000]
-# budget is per-run (--budget); results -> sims/wc_sweep_r<budget>_r204/
 
-
-def _build_combos():
-    """(label, alpha, thr, size, cap) grid. Thresholds = {PCTS} percentiles of
-    |alpha| computed on the SAME in-sample as the sweep (wc_games()[:N_TRAIN]) via
-    the game-set-keyed cache (threshold_cache.get_thresholds) — never a hardcoded
-    game list, never recomputed when the in-sample is unchanged."""
-    from threshold_cache import get_thresholds
-    pct = get_thresholds(wc_games()[:N_TRAIN], SWEEP_ALPHAS, PCTS)
-    out = []
-    for a in SWEEP_ALPHAS:
-        for thr in sorted({pct[a][str(p)] for p in PCTS}):
-            for s in SIZES:
-                for cap in CAPS:
-                    if s <= cap:
-                        out.append((a, a, thr, s, cap))
-    return out
+# ---- default study: obi_dev vs obi_dev AND agg_dev ----
+N_TRAIN = 21                                  # 21 in-sample / 6 out-sample (27-game set)
+RESULTS_DIR = SIMS / "wc_sweep_aggdev216"     # fresh dir (per-config store)
+FORWARD_DELAY = 0.020
+BUDGET = 250
+FREE_BUDGET = True
+SIZE, CAP = 200, 1000
+PCTS = [50, 75, 90]                           # per-alpha |alpha| percentiles on the in-sample
+OBI_HLS = [10, 60, 300]                       # obi_dev half-lives (s)
+AGG_HLS = [1, 10, 60]                         # agg_dev half-lives (s)
 
 
 def wc_games():
     return sorted(DATASET.glob("KXWCGAME*.jsonl.gz"))   # chronological by ticker date
 
 
-def _agg(games, cfg):
-    r = {"net": 0.0, "realized_net": 0.0, "fills": 0, "fees": 0.0, "n": 0}
+def default_splits():
+    games = wc_games()
+    return games[:N_TRAIN], games[N_TRAIN:]             # 21 train / 6 test (chronological)
+
+
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _bps(games):
+    """PnL efficiency: total net / total dollar volume traded, in bps (edge per $
+    transacted). `games` is a {stem: {net, volume, ...}} per-game dict."""
+    vol = sum(g.get("volume", 0.0) for g in games.values())
+    net = sum(g["net"] for g in games.values())
+    return net / vol * 1e4 if vol else 0.0
+
+
+def build_default_configs():
+    """36 configs as a list of (label, cfg_dict). Arm A: obi_dev alone (3 HL x 3 pct).
+    Arm B: obi_dev AND agg_dev (3 obi_hl x 3 agg_hl x 3 pct). All gates symmetric;
+    thresholds = each alpha's pct-percentile of |alpha| on the in-sample (same pct
+    selects both alphas' percentiles in a combo)."""
+    from threshold_cache import get_thresholds
+    inn, _ = default_splits()
+    obi_names = [f"obi_dev_{h}s" for h in OBI_HLS]
+    agg_names = [f"agg_dev_{h}s" for h in AGG_HLS]
+    thr = get_thresholds(inn, obi_names + agg_names, PCTS)
+    base = {"per_order_size": SIZE, "inventory_cap": CAP, "budget": BUDGET,
+            "football": True, "free_budget": FREE_BUDGET,
+            "forward_delay": FORWARD_DELAY, **REALISTIC_DELAYS}
+    configs = []
+    for oh in OBI_HLS:                                   # arm A: obi_dev only
+        for p in PCTS:
+            gates = [{"family": "obi_dev", "hl": oh, "threshold": thr[f"obi_dev_{oh}s"][str(p)]}]
+            configs.append((f"A_obi{oh}s_p{p}", {**base, "alphas": gates}))
+    for oh in OBI_HLS:                                   # arm B: obi_dev AND agg_dev
+        for ah in AGG_HLS:
+            for p in PCTS:
+                gates = [{"family": "obi_dev", "hl": oh, "threshold": thr[f"obi_dev_{oh}s"][str(p)]},
+                         {"family": "agg_dev", "hl": ah, "threshold": thr[f"agg_dev_{ah}s"][str(p)]}]
+                configs.append((f"B_obi{oh}s_agg{ah}s_p{p}", {**base, "alphas": gates}))
+    return configs
+
+
+def _per_game(games, cfg):
+    """{stem: {net, realized_net, fills}} for one config over `games`."""
+    out = {}
     for g in games:
         row = run_one(g, "KXWCGAME", cfg)
         if row is None:
             continue
-        r["net"] += row["net_pnl"]
-        r["realized_net"] += row["realized_pnl"] - row["fees_paid"]
-        r["fills"] += row["n_fills"]
-        r["fees"] += row["fees_paid"]
-        r["n"] += 1
-    return r
+        out[g.stem.replace(".jsonl", "")] = {
+            "net": round(row["net_pnl"], 4),
+            "realized_net": round(row["realized_pnl"] - row["fees_paid"], 4),
+            "fills": row["n_fills"],
+            "volume": row["volume"]}
+    return out
 
 
-def run_shard(shard, n, budget, results, free_budget=False):
+def run_shard(shard, n, configs, inn, out, results):
+    """Run this shard's slice of `configs`, writing one JSON per config holding the
+    per-(config, game) PnLs for the in and out sets. Resume/preempt-safe (skips
+    already-written configs)."""
     results.mkdir(parents = True, exist_ok = True)
-    games = wc_games()
-    inn, out = games[:N_TRAIN], games[N_TRAIN:]    # 20 train / 4 test (chronological)
-    for idx, (label, alpha, thr, s, cap) in enumerate(_build_combos()):
+    for idx, (label, cfg) in enumerate(configs):
         if idx % n != shard:
             continue
-        f = results / f"wc_{label}_t{thr:g}_s{s}_c{cap}.json"
+        f = results / f"wc_{label}.json"
         if f.exists():
-            continue                               # resume-safe (skip done combos; preempt requeue)
-        cfg = {"alpha_name": alpha, "skew_threshold": thr, "per_order_size": s,
-               "inventory_cap": cap, "budget": budget, "football": True,
-               "free_budget": free_budget,
-               "forward_delay": FORWARD_DELAY, **REALISTIC_DELAYS}
-        res = {"label": label, "alpha": alpha, "thr": thr, "size": s, "cap": cap,
-               "in": _agg(inn, cfg), "out": _agg(out, cfg)}
-        with open(f, "w") as fh:
-            json.dump(res, fh)
-        print(f"{label:>6} t{thr:<7g} s{s:<4} c{cap:<5} in_net={res['in']['net']:+8.1f} "
-              f"out_net={res['out']['net']:+8.1f}", flush = True)
+            continue
+        res = {"label": label, "alphas": cfg["alphas"],
+               "in": {"games": _per_game(inn, cfg)},
+               "out": {"games": _per_game(out, cfg)}}
+        f.write_text(json.dumps(res))
+        in_net = _mean([g["net"] for g in res["in"]["games"].values()])
+        out_net = _mean([g["net"] for g in res["out"]["games"].values()])
+        print(f"{label:>24} in_net/g={in_net:+8.2f} out_net/g={out_net:+8.2f} "
+              f"in_bps={_bps(res['in']['games']):+6.1f} out_bps={_bps(res['out']['games']):+6.1f}",
+              flush = True)
 
 
-def collect(results, budget, suffix=RESULTS_SUFFIX, free_budget=False):
-    rows = [json.load(open(p)) for p in sorted(results.glob("wc_*.json"))]
-    print(f"{len(rows)}/{len(_build_combos())} combos done\n")
+def best_configs(results, score_fn=None):
+    """Read the per-(config, game) store and return (best_in, best_out), each a
+    (row, score) tuple. `score_fn(list_of_per_game_net) -> float` decides "best"
+    (default = mean). Applied to the in-sample and out-sample arrays independently."""
+    score_fn = score_fn or _mean
+    rows = [json.loads(p.read_text()) for p in sorted(results.glob("wc_*.json"))]
+    if not rows:
+        return None, None
 
-    # PER-GAME is the ranking + deploy criterion (the IN/OUT sets differ in game
-    # count, 20 vs 4, so summed totals over-weight the larger set). pg = total/game.
-    def pg(agg, k):
-        return agg[k] / agg["n"] if agg["n"] else 0.0
+    def score(row, key):
+        vals = [g["net"] for g in row[key]["games"].values()]
+        return score_fn(vals) if vals else float("-inf")
 
-    print(f"{'label':>12} {'thr':>8} {'size':>5} {'cap':>5} {'IN_net/g':>9} {'OUT_net/g':>9} "
-          f"{'IN_rn/g':>9} {'OUT_rn/g':>9} {'in_fills':>8}")
-    for r in sorted(rows, key = lambda r: -pg(r["out"], "net")):   # rank by per-game OOS net
-        print(f"{r['label']:>12} {r['thr']:>8g} {r['size']:>5g} {r['cap']:>5g} "
-              f"{pg(r['in'], 'net'):>+9.2f} {pg(r['out'], 'net'):>+9.2f} "
-              f"{pg(r['in'], 'realized_net'):>+9.2f} {pg(r['out'], 'realized_net'):>+9.2f} {r['in']['fills']:>8}")
-    print("\n=== per-alpha: best OUT-sample config (per-game OOS net) ===")
-    for a in SWEEP_ALPHAS:
-        sub = [r for r in rows if r["label"] == a]
-        if sub:
-            b = max(sub, key = lambda r: pg(r["out"], "net"))
-            print(f"{a:>12}: best-out thr={b['thr']:g} s={b['size']} cap={b['cap']} -> "
-                  f"OUT net/g {pg(b['out'], 'net'):+.2f} (OUT rn/g {pg(b['out'], 'realized_net'):+.2f}, "
-                  f"IN net/g {pg(b['in'], 'net'):+.2f})")
-    if rows:
-        bo = max(rows, key = lambda r: pg(r["out"], "net"))        # DEPLOY = best per-game OOS net
-        brn = max(rows, key = lambda r: pg(r["out"], "realized_net"))
-        # Persist the FULL strategy spec (incl. the flags the sweep ran with) so the
-        # deploy reproduces it exactly — run_live applies every config key onto args.
-        (STUDIES / f"wc_best_config_r{int(budget)}{suffix}.json").write_text(
-            json.dumps({"alpha": bo["alpha"], "thr": bo["thr"], "size": bo["size"], "cap": bo["cap"],
-                        "free_budget": free_budget, "liquidate_no_alpha": False}))
-        print(f"\nBEST OOS net/g (-> deploy file): {bo['label']} thr={bo['thr']:g} s={bo['size']} "
-              f"cap={bo['cap']} -> OUT net/g {pg(bo['out'], 'net'):+.2f} / OUT rn/g {pg(bo['out'], 'realized_net'):+.2f} "
-              f"(IN net/g {pg(bo['in'], 'net'):+.2f})")
-        print(f"BEST OOS realized-net/g: {brn['label']} thr={brn['thr']:g} s={brn['size']} "
-              f"cap={brn['cap']} -> OUT rn/g {pg(brn['out'], 'realized_net'):+.2f} / OUT net/g {pg(brn['out'], 'net'):+.2f}")
+    best_in = max(rows, key = lambda r: score(r, "in"))
+    best_out = max(rows, key = lambda r: score(r, "out"))
+    return (best_in, score(best_in, "in")), (best_out, score(best_out, "out"))
+
+
+def finalize(results, score_fn=None):
+    """Rank configs by per-game OOS net, and write the best-in / best-out deploy
+    specs from the stored PnLs (no sims re-run)."""
+    bi, bo = best_configs(results, score_fn)
+    if bi is None:
+        print(f"no results in {results}")
+        return
+    rows = [json.loads(p.read_text()) for p in sorted(results.glob("wc_*.json"))]
+    pg = lambda r, k: _mean([g["net"] for g in r[k]["games"].values()])
+    print(f"{len(rows)} configs in {results.name}\n")
+    print(f"{'label':>24} {'IN_net/g':>9} {'OUT_net/g':>9} {'IN_bps':>7} {'OUT_bps':>7} {'in_fills':>9}")
+    for r in sorted(rows, key = lambda r: -pg(r, "out")):
+        in_fills = sum(g["fills"] for g in r["in"]["games"].values())
+        print(f"{r['label']:>24} {pg(r, 'in'):>+9.2f} {pg(r, 'out'):>+9.2f} "
+              f"{_bps(r['in']['games']):>+7.1f} {_bps(r['out']['games']):>+7.1f} {in_fills:>9}")
+    (bi_row, bi_s), (bo_row, bo_s) = bi, bo
+    STUDIES.mkdir(parents = True, exist_ok = True)
+    for tag, row in (("in", bi_row), ("out", bo_row)):
+        spec = {"alphas": row["alphas"], "per_order_size": SIZE, "inventory_cap": CAP,
+                "budget": BUDGET, "free_budget": FREE_BUDGET, "football": True}
+        (STUDIES / f"wc_best_{tag}_{results.name}.json").write_text(json.dumps(spec))
+    print(f"\nBEST IN  ({bi_s:+.2f}/g): {bi_row['label']}  {bi_row['alphas']}")
+    print(f"BEST OUT ({bo_s:+.2f}/g): {bo_row['label']}  {bo_row['alphas']}")
+    print(f"deploy specs -> {STUDIES}/wc_best_in_{results.name}.json , wc_best_out_{results.name}.json")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--shard", type = int, default = 0)
     ap.add_argument("--num-shards", type = int, default = 1)
-    ap.add_argument("--budget", type = float, default = 1000.0)
-    ap.add_argument("--collect", action = "store_true")
     ap.add_argument("--prep", action = "store_true",
                     help = "compute + cache the in-sample thresholds (warm before sharding)")
-    ap.add_argument("--free-budget", action = "store_true",
-                    help = "re-enable the pre-33fe652 over-budget reduce-only netting (own dir suffix _fb)")
+    ap.add_argument("--finalize", action = "store_true",
+                    help = "pick best-in / best-out from the stored per-game PnLs (no sims)")
     a = ap.parse_args()
-    suffix = RESULTS_SUFFIX + ("_fb" if a.free_budget else "")
-    results = SIMS / f"wc_sweep_r{int(a.budget)}{suffix}"
     if a.prep:
-        _build_combos()                          # triggers get_thresholds (compute + cache)
-    elif a.collect:
-        collect(results, a.budget, suffix, a.free_budget)
+        build_default_configs()                          # triggers get_thresholds (compute + cache)
+    elif a.finalize:
+        finalize(RESULTS_DIR)
     else:
-        run_shard(a.shard, a.num_shards, a.budget, results, a.free_budget)
+        inn, out = default_splits()
+        run_shard(a.shard, a.num_shards, build_default_configs(), inn, out, RESULTS_DIR)
 
 
 if __name__ == "__main__":
